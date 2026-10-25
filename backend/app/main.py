@@ -12,6 +12,7 @@ from app.api.missions import router as missions_router
 from app.api.simulator_routes import router as simulator_router
 from app.api.telemetry import router as telemetry_router, set_pipeline
 from app.api.commands import router as commands_router
+from app.api.map_tiles import router as map_tiles_router
 from app.config import get_settings
 from app.database.models import Mission, current_time_ms
 from app.database.session import init_db, AsyncSessionLocal
@@ -96,6 +97,7 @@ app.include_router(missions_router)
 app.include_router(config_router)
 app.include_router(simulator_router)
 app.include_router(commands_router)
+app.include_router(map_tiles_router)
 
 # Mount frontend production build if present for offline all-in-one execution
 frontend_dist = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..", "frontend", "dist"))

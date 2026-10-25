@@ -133,7 +133,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
   };
 
   const navItems = [
-    { id: 'dashboard', label: 'Flight PFD' },
+    { id: 'dashboard', label: 'Flight Deck & Google Map' },
     { id: 'missions', label: 'Missions' },
     { id: 'telemetry', label: 'Telemetry Logs' },
     { id: 'diagnostics', label: 'Diagnostics & Simulator' },
@@ -146,7 +146,7 @@ export const Navbar: React.FC<NavbarProps> = ({ currentTab, onSelectTab }) => {
 
   return (
     <header className="border-b border-slate-800 bg-slate-950/80 backdrop-blur sticky top-0 z-50">
-      <div className="max-w-7xl mx-auto px-4 py-2.5 flex items-center justify-between">
+      <div className="max-w-[1720px] mx-auto px-4 py-2.5 flex items-center justify-between">
         {/* Brand & Drone Identity */}
         <div className="flex items-center gap-6">
           <div className="flex items-center gap-2.5">

@@ -28,22 +28,29 @@ class TelemetryWebSocketManager:
         logger.info(f"WebSocket client disconnected. Total clients: {len(self.active_connections)}")
 
     async def broadcast(self, message: Dict[str, Any]) -> None:
-        """Broadcast payload to all active clients concurrently."""
+        """Broadcast payload to all active clients concurrently without blocking the pipeline."""
         if not self.active_connections:
             return
 
         payload_text = json.dumps(message)
-        dead_connections = []
 
         async with self._lock:
             connections = list(self.active_connections)
 
-        for connection in connections:
+        if not connections:
+            return
+
+        dead_connections = []
+
+        async def _send_to_client(conn: WebSocket) -> None:
             try:
-                await connection.send_text(payload_text)
+                await asyncio.wait_for(conn.send_text(payload_text), timeout=0.25)
             except Exception as e:
                 logger.debug(f"Error sending to WebSocket client: {e}")
-                dead_connections.append(connection)
+                dead_connections.append(conn)
+
+        # Dispatch sends concurrently across all connected UI clients
+        await asyncio.gather(*[_send_to_client(c) for c in connections], return_exceptions=True)
 
         if dead_connections:
             async with self._lock:

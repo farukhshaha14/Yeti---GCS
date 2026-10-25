@@ -191,3 +191,55 @@ def test_scenario_9_unrecoverable_packet_timeout():
     health = engine.get_data_health()
     assert health.unrecovered_packets == 1
     assert engine.gaps[2]["status"] == "UNRECOVERED"
+
+
+def test_scenario_10_mavlink_8bit_sequence_wraparound():
+    """Test 10: MAVLink 8-bit uint8 sequence wraparound: 254 -> 255 -> 0 -> 1 with zero false duplicates."""
+    engine = TelemetryReliabilityEngine(mission_id="TEST-10-WRAP")
+    now = int(time.time() * 1000)
+
+    for seq in [254, 255, 0, 1, 2]:
+        recv_seq, is_dup, is_ooo, is_rec = engine.process_incoming_packet(
+            source_seq=seq,
+            source_timestamp=now - 10,
+            received_at_ms=now,
+            is_valid=True,
+        )
+        assert is_dup is False, f"Sequence #{seq} wrongly marked as duplicate during wraparound"
+        assert is_ooo is False, f"Sequence #{seq} wrongly marked as out-of-order during wraparound"
+
+    health = engine.get_data_health()
+    assert health.duplicate_packets == 0
+    assert health.out_of_order_packets == 0
+    assert health.missing_packets == 0
+
+    # Test gap across wraparound: 254 -> 1 (missing 255, 0)
+    engine_gap = TelemetryReliabilityEngine(mission_id="TEST-10-WRAP-GAP")
+    engine_gap.process_incoming_packet(source_seq=254, source_timestamp=now, received_at_ms=now, is_valid=True)
+    engine_gap.process_incoming_packet(source_seq=1, source_timestamp=now, received_at_ms=now, is_valid=True)
+
+    assert 255 in engine_gap.gaps
+    assert 0 in engine_gap.gaps
+    assert engine_gap.highest_source_sequence == 1
+
+
+def test_scenario_11_loss_percentage_triggers_degraded():
+    """Test 11: Section 12 rule: loss > 5% marks connection as DEGRADED even when age < 1000ms."""
+    engine = TelemetryReliabilityEngine(mission_id="TEST-11-LOSS-DEGRADED")
+    now = int(time.time() * 1000)
+
+    # 10 packets total: send 9 packets with 1 missing (10% loss)
+    # Packets 1..5 arrive, 6 missing, 7..10 arrive
+    for seq in [1, 2, 3, 4, 5, 7, 8, 9, 10]:
+        engine.process_incoming_packet(
+            source_seq=seq,
+            source_timestamp=now - 50,
+            received_at_ms=now - 10,  # age is only 10ms (< 1000ms)
+            is_valid=True,
+        )
+
+    health = engine.get_data_health()
+    # 1 missing out of 10 expected = 10% loss > 5%
+    assert health.packet_loss_percent > 5.0
+    assert health.last_packet_age_ms < 1000
+    assert health.status == "DEGRADED"

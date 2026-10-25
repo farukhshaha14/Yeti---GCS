@@ -1,11 +1,32 @@
 import React, { useEffect, useState } from 'react';
-import { Filter, ChevronLeft, ChevronRight } from 'lucide-react';
-import type { TelemetryPacketItem } from '../types/telemetry';
-import { fetchMissionTelemetry } from '../services/apiService';
+import {
+  Filter,
+  ChevronLeft,
+  ChevronRight,
+  Download,
+  Play,
+  Square,
+  Repeat,
+  Database,
+} from 'lucide-react';
+import type { TelemetryPacketItem, Mission } from '../types/telemetry';
+import {
+  fetchTelemetryLogs,
+  fetchMissions,
+  startTelemetryReplay,
+  stopTelemetryReplay,
+  fetchTelemetryReplayStatus,
+} from '../services/apiService';
 import { useMissionStore } from '../stores/useMissionStore';
+import { useAlertStore } from '../stores/useAlertStore';
 
 export const TelemetryLogPage: React.FC = () => {
   const { activeMissionId } = useMissionStore();
+  const { addAlert } = useAlertStore();
+
+  const [missions, setMissions] = useState<Mission[]>([]);
+  const [selectedMissionId, setSelectedMissionId] = useState<string>(activeMissionId);
+
   const [items, setItems] = useState<TelemetryPacketItem[]>([]);
   const [page, setPage] = useState(1);
   const [totalPages, setTotalPages] = useState(1);
@@ -17,8 +38,35 @@ export const TelemetryLogPage: React.FC = () => {
   const [validFilter, setValidFilter] = useState<string>('all');
   const [recoveredFilter, setRecoveredFilter] = useState<string>('all');
 
+  // Replay State
+  const [isReplaying, setIsReplaying] = useState(false);
+  const [replaySpeed, setReplaySpeed] = useState<number>(1.0);
+  const [replayProgress, setReplayProgress] = useState<{ current: number; total: number }>({
+    current: 0,
+    total: 0,
+  });
+
   // Selected packet for JSON preview modal
   const [selectedPacket, setSelectedPacket] = useState<TelemetryPacketItem | null>(null);
+
+  // Load available missions from SQLite
+  useEffect(() => {
+    fetchMissions()
+      .then((data) => {
+        setMissions(data);
+        if (data.length > 0 && !selectedMissionId) {
+          setSelectedMissionId(activeMissionId || data[0].mission_id);
+        }
+      })
+      .catch(console.error);
+  }, [activeMissionId]);
+
+  // Synchronize when active mission changes
+  useEffect(() => {
+    if (activeMissionId) {
+      setSelectedMissionId(activeMissionId);
+    }
+  }, [activeMissionId]);
 
   const loadPackets = async () => {
     try {
@@ -30,7 +78,7 @@ export const TelemetryLogPage: React.FC = () => {
       if (recoveredFilter === 'recovered') filters.is_recovered = true;
       if (recoveredFilter === 'normal') filters.is_recovered = false;
 
-      const data = await fetchMissionTelemetry(activeMissionId, page, 50, filters);
+      const data = await fetchTelemetryLogs(selectedMissionId, page, 50, filters);
       setItems(data.items);
       setTotalPages(data.total_pages);
       setTotalItems(data.total_items);
@@ -43,10 +91,162 @@ export const TelemetryLogPage: React.FC = () => {
 
   useEffect(() => {
     loadPackets();
-  }, [activeMissionId, page, msgTypeFilter, validFilter, recoveredFilter]);
+  }, [selectedMissionId, page, msgTypeFilter, validFilter, recoveredFilter]);
+
+  // Check replay status periodically
+  useEffect(() => {
+    let interval: any;
+    if (isReplaying) {
+      interval = setInterval(async () => {
+        try {
+          const status = await fetchTelemetryReplayStatus();
+          setIsReplaying(status.is_replaying);
+          setReplayProgress({ current: status.current, total: status.total });
+          if (!status.is_replaying) {
+            clearInterval(interval);
+          }
+        } catch (e) {
+          console.error(e);
+        }
+      }, 1000);
+    }
+    return () => clearInterval(interval);
+  }, [isReplaying]);
+
+  // Start Replay
+  const handleStartReplay = async () => {
+    if (!selectedMissionId) return;
+    try {
+      const res = await startTelemetryReplay(selectedMissionId, replaySpeed);
+      setIsReplaying(true);
+      setReplayProgress({ current: 0, total: res.total || 0 });
+      addAlert({
+        type: 'INFO',
+        title: 'SESSION REPLAY STARTED',
+        message: `Replaying flight session ${selectedMissionId} at ${replaySpeed}x speed into PFD.`,
+      });
+    } catch (err: any) {
+      addAlert({
+        type: 'WARNING',
+        title: 'REPLAY FAILED',
+        message: err.message || 'Failed to start replay',
+      });
+    }
+  };
+
+  // Stop Replay
+  const handleStopReplay = async () => {
+    try {
+      await stopTelemetryReplay();
+      setIsReplaying(false);
+      addAlert({
+        type: 'INFO',
+        title: 'REPLAY STOPPED',
+        message: 'Telemetry session replay terminated.',
+      });
+    } catch (err: any) {
+      console.error(err);
+    }
+  };
 
   return (
     <div className="space-y-4">
+      {/* Top Bar: Mission Selector & Export & Replay Controls */}
+      <div className="bg-slate-900 border border-slate-800 p-4 rounded-lg flex flex-col md:flex-row md:items-center justify-between gap-4 text-xs font-mono">
+        <div className="flex items-center gap-3">
+          <Database className="w-5 h-5 text-cyan-400 shrink-0" />
+          <div>
+            <div className="text-[11px] text-slate-400 font-bold uppercase tracking-wider">
+              Inspect Flight Session:
+            </div>
+            <select
+              value={selectedMissionId}
+              onChange={(e) => {
+                setSelectedMissionId(e.target.value);
+                setPage(1);
+              }}
+              className="bg-slate-950 border border-slate-700 rounded px-2.5 py-1 text-slate-100 font-bold text-xs focus:outline-none focus:border-cyan-500 mt-0.5"
+            >
+              {missions.map((m) => (
+                <option key={m.mission_id} value={m.mission_id}>
+                  {m.mission_id} • {m.name} ({m.packet_count.toLocaleString()} pkts)
+                  {m.mission_id === activeMissionId ? ' [ACTIVE]' : ''}
+                </option>
+              ))}
+            </select>
+          </div>
+        </div>
+
+        {/* Replay Flight Controls & Exports */}
+        <div className="flex items-center flex-wrap gap-2.5">
+          {/* Replay session */}
+          <div className="flex items-center gap-1.5 bg-slate-950/80 p-1.5 rounded border border-slate-800">
+            <span className="text-[10px] text-slate-400 uppercase">Speed:</span>
+            <select
+              value={replaySpeed}
+              onChange={(e) => setReplaySpeed(Number(e.target.value))}
+              disabled={isReplaying}
+              className="bg-slate-900 border border-slate-800 rounded px-1.5 py-0.5 text-slate-200 text-[11px]"
+            >
+              <option value={0.5}>0.5x</option>
+              <option value={1.0}>1.0x</option>
+              <option value={2.0}>2.0x</option>
+              <option value={5.0}>5.0x</option>
+              <option value={10.0}>10.0x</option>
+            </select>
+            {isReplaying ? (
+              <button
+                onClick={handleStopReplay}
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-rose-600 hover:bg-rose-500 text-white font-bold text-[11px] transition"
+              >
+                <Square className="w-3 h-3" /> Stop Replay
+              </button>
+            ) : (
+              <button
+                onClick={handleStartReplay}
+                className="flex items-center gap-1 px-2.5 py-1 rounded bg-purple-600 hover:bg-purple-500 text-white font-bold text-[11px] transition shadow"
+                title="Replay stored packets from SQLite back into the Primary Flight Display (PFD)"
+              >
+                <Play className="w-3 h-3" /> Replay to PFD
+              </button>
+            )}
+          </div>
+
+          {/* Export Buttons */}
+          <a
+            href={`/api/missions/${selectedMissionId}/export/csv`}
+            download
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-slate-800 hover:bg-slate-700 text-slate-200 text-xs font-semibold border border-slate-700 transition"
+          >
+            <Download className="w-3 h-3" /> CSV
+          </a>
+          <a
+            href={`/api/missions/${selectedMissionId}/export/json`}
+            download
+            className="flex items-center gap-1 px-2.5 py-1.5 rounded bg-cyan-600/80 hover:bg-cyan-600 text-white text-xs font-semibold border border-cyan-500/50 transition"
+          >
+            <Download className="w-3 h-3" /> JSON
+          </a>
+        </div>
+      </div>
+
+      {/* Replay Progress Banner */}
+      {isReplaying && (
+        <div className="bg-purple-950/40 border border-purple-500/40 p-3 rounded-lg flex items-center justify-between text-xs font-mono animate-pulse">
+          <div className="flex items-center gap-2 text-purple-300">
+            <Repeat className="w-4 h-4 animate-spin text-purple-400" />
+            <span>
+              REPLAY IN PROGRESS: Playing packet #{replayProgress.current} of {replayProgress.total} into cockpit PFD...
+            </span>
+          </div>
+          <div className="text-purple-200 font-bold">
+            {replayProgress.total > 0
+              ? `${Math.round((replayProgress.current / replayProgress.total) * 100)}%`
+              : '0%'}
+          </div>
+        </div>
+      )}
+
       {/* Filters Bar */}
       <div className="bg-slate-900 border border-slate-800 p-3.5 rounded-lg flex flex-wrap items-center justify-between gap-3 text-xs font-mono">
         <div className="flex flex-wrap items-center gap-3">
@@ -136,9 +336,20 @@ export const TelemetryLogPage: React.FC = () => {
                   const p = item.payload || {};
                   let summary = '--';
                   if (item.message_type === 'GLOBAL_POSITION_INT') {
-                    const lat = typeof p.lat === 'number' ? (p.lat > 1000 ? (p.lat / 1e7).toFixed(5) : p.lat.toFixed(5)) : '--';
-                    const lon = typeof p.lon === 'number' ? (p.lon > 1000 ? (p.lon / 1e7).toFixed(5) : p.lon.toFixed(5)) : '--';
-                    const alt = typeof p.relative_alt === 'number' ? (p.relative_alt / 1000).toFixed(1) : (typeof p.alt === 'number' ? p.alt.toFixed(1) : '--');
+                    const lat =
+                      typeof p.lat === 'number'
+                        ? (p.lat > 1000 ? (p.lat / 1e7).toFixed(5) : p.lat.toFixed(5))
+                        : '--';
+                    const lon =
+                      typeof p.lon === 'number'
+                        ? (p.lon > 1000 ? (p.lon / 1e7).toFixed(5) : p.lon.toFixed(5))
+                        : '--';
+                    const alt =
+                      typeof p.relative_alt === 'number'
+                        ? (p.relative_alt / 1000).toFixed(1)
+                        : typeof p.alt === 'number'
+                        ? p.alt.toFixed(1)
+                        : '--';
                     summary = `Pos: ${lat}, ${lon} | Alt: ${alt}m`;
                   } else if (item.message_type === 'ATTITUDE') {
                     const r = typeof p.roll === 'number' ? (p.roll * (180 / Math.PI)).toFixed(1) : '--';
@@ -146,12 +357,21 @@ export const TelemetryLogPage: React.FC = () => {
                     const y = typeof p.yaw === 'number' ? (p.yaw * (180 / Math.PI)).toFixed(1) : '--';
                     summary = `Roll: ${r}° | Pitch: ${pt}° | Yaw: ${y}°`;
                   } else if (item.message_type === 'SYS_STATUS') {
-                    const v = typeof p.voltage_battery === 'number' ? (p.voltage_battery > 100 ? (p.voltage_battery / 1000).toFixed(1) : p.voltage_battery.toFixed(1)) : '--';
+                    const v =
+                      typeof p.voltage_battery === 'number'
+                        ? (p.voltage_battery > 100 ? (p.voltage_battery / 1000).toFixed(1) : p.voltage_battery.toFixed(1))
+                        : '--';
                     const pct = typeof p.battery_remaining === 'number' ? `${p.battery_remaining}%` : '--';
                     summary = `Battery: ${v}V (${pct})`;
                   } else if (item.message_type === 'HEARTBEAT') {
                     const mode = p.flight_mode || (p.custom_mode !== undefined ? `Mode ${p.custom_mode}` : 'AUTO');
-                    const armed = p.base_mode ? ((p.base_mode & 128) ? 'ARMED' : 'DISARMED') : (p.armed ? 'ARMED' : 'DISARMED');
+                    const armed = p.base_mode
+                      ? p.base_mode & 128
+                        ? 'ARMED'
+                        : 'DISARMED'
+                      : p.armed
+                      ? 'ARMED'
+                      : 'DISARMED';
                     summary = `${mode} | ${armed}`;
                   } else {
                     summary = `${Object.keys(p).slice(0, 3).join(', ')}`;
@@ -198,14 +418,22 @@ export const TelemetryLogPage: React.FC = () => {
                             </span>
                           )}
                           {item.is_valid && !item.is_recovered && !item.is_duplicate && !item.is_out_of_order && (
-                            <span className="px-1.5 py-0.5 rounded text-[10px] font-bold bg-slate-800 text-slate-400">
-                              VERIFIED
+                            <span className="px-1.5 py-0.5 rounded text-[10px] text-slate-400 bg-slate-800">
+                              OK
                             </span>
                           )}
                         </div>
                       </td>
-                      <td className="p-3 text-right text-slate-500 text-[11px]">
-                        Inspect JSON →
+                      <td className="p-3 text-right">
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setSelectedPacket(item);
+                          }}
+                          className="px-2 py-0.5 rounded bg-slate-800 hover:bg-slate-700 text-cyan-400 text-[10px]"
+                        >
+                          Inspect JSON
+                        </button>
                       </td>
                     </tr>
                   );
@@ -215,25 +443,23 @@ export const TelemetryLogPage: React.FC = () => {
           </table>
         </div>
 
-        {/* Pagination Bar */}
-        <div className="bg-slate-950 px-4 py-3 border-t border-slate-800 flex items-center justify-between text-xs font-mono">
+        {/* Pagination Controls */}
+        <div className="p-3 bg-slate-950/80 border-t border-slate-800 flex items-center justify-between font-mono text-xs">
           <span className="text-slate-400">
-            Page <span className="text-slate-200 font-bold">{page}</span> of{' '}
-            <span className="text-slate-200 font-bold">{totalPages}</span>
+            Page {page} of {totalPages}
           </span>
-
           <div className="flex items-center gap-2">
             <button
-              disabled={page <= 1}
               onClick={() => setPage((p) => Math.max(1, p - 1))}
-              className="p-1.5 rounded border border-slate-800 hover:bg-slate-800 disabled:opacity-30 disabled:hover:bg-transparent text-slate-300"
+              disabled={page <= 1}
+              className="p-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 text-slate-200"
             >
               <ChevronLeft className="w-4 h-4" />
             </button>
             <button
-              disabled={page >= totalPages}
               onClick={() => setPage((p) => Math.min(totalPages, p + 1))}
-              className="p-1.5 rounded border border-slate-800 hover:bg-slate-800 disabled:opacity-30 disabled:hover:bg-transparent text-slate-300"
+              disabled={page >= totalPages}
+              className="p-1 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-30 disabled:hover:bg-slate-800 text-slate-200"
             >
               <ChevronRight className="w-4 h-4" />
             </button>
@@ -243,22 +469,46 @@ export const TelemetryLogPage: React.FC = () => {
 
       {/* JSON Payload Inspection Modal */}
       {selectedPacket && (
-        <div className="fixed inset-0 z-50 bg-black/70 backdrop-blur-sm flex items-center justify-center p-4">
-          <div className="bg-slate-900 border border-slate-800 rounded-lg max-w-xl w-full p-4 font-mono">
-            <div className="flex items-center justify-between pb-2 border-b border-slate-800 mb-3">
-              <span className="text-xs font-bold text-cyan-400">
-                Packet #{selectedPacket.source_sequence} ({selectedPacket.message_type})
-              </span>
+        <div className="fixed inset-0 z-50 bg-black/80 backdrop-blur-sm flex items-center justify-center p-4">
+          <div className="bg-slate-900 border border-slate-800 rounded-lg max-w-xl w-full p-4 font-mono text-xs shadow-2xl space-y-3">
+            <div className="flex items-center justify-between border-b border-slate-800 pb-2">
+              <h4 className="font-bold text-cyan-400 flex items-center gap-2">
+                <span>Packet #{selectedPacket.receive_sequence}</span>
+                <span className="text-slate-400 font-normal">({selectedPacket.message_type})</span>
+              </h4>
               <button
                 onClick={() => setSelectedPacket(null)}
-                className="text-xs text-slate-400 hover:text-slate-100"
+                className="text-slate-400 hover:text-slate-100"
               >
                 ✕ Close
               </button>
             </div>
-            <pre className="bg-slate-950 p-3 rounded text-[11px] text-slate-300 max-h-96 overflow-y-auto">
-              {JSON.stringify(selectedPacket.payload, null, 2)}
-            </pre>
+
+            <div className="grid grid-cols-2 gap-2 text-[11px] bg-slate-950 p-2.5 rounded border border-slate-800">
+              <div>
+                <span className="text-slate-500">Source Seq:</span> #{selectedPacket.source_sequence ?? '--'}
+              </div>
+              <div>
+                <span className="text-slate-500">Receive Seq:</span> #{selectedPacket.receive_sequence}
+              </div>
+              <div>
+                <span className="text-slate-500">Received At:</span>{' '}
+                {new Date(selectedPacket.received_at).toLocaleTimeString()}.
+                {selectedPacket.received_at % 1000}
+              </div>
+              <div>
+                <span className="text-slate-500">Processed At:</span>{' '}
+                {new Date(selectedPacket.processed_at).toLocaleTimeString()}.
+                {selectedPacket.processed_at % 1000}
+              </div>
+            </div>
+
+            <div>
+              <span className="text-[10px] text-slate-500 uppercase block mb-1">Raw Payload JSON:</span>
+              <pre className="bg-slate-950 p-3 rounded border border-slate-800 max-h-60 overflow-y-auto text-[11px] text-emerald-300">
+                {JSON.stringify(selectedPacket.payload, null, 2)}
+              </pre>
+            </div>
           </div>
         </div>
       )}

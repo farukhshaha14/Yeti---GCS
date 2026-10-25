@@ -57,3 +57,17 @@ body {
   border-radius: 9999px;
   box-shadow: inset 0 0 20px rgba(0, 0, 0, 0.8);
 }
+
+/* Tactical Leaflet Dark Tooltips */
+.leaflet-tooltip.gcs-dark-tooltip {
+  background: rgba(3, 7, 18, 0.95) !important;
+  border: 1px solid #1e293b !important;
+  color: #f1f5f9 !important;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.8) !important;
+  border-radius: 6px !important;
+  padding: 6px 10px !important;
+}
+.leaflet-tooltip.gcs-dark-tooltip::before {
+  border-top-color: #1e293b !important;
+}
+

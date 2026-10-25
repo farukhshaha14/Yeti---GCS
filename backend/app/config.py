@@ -36,10 +36,15 @@ class Settings(BaseSettings):
     operation_mode: Literal["DEMO", "SIMULATOR", "HARDWARE"] = Field(default="SIMULATOR")
     drone_id: str = Field(default="VEGAPilot-01")
 
-    # Latency and Staleness Thresholds (milliseconds)
-    stale_threshold_degraded_ms: int = Field(default=500, description="Threshold for DEGRADED state")
-    stale_threshold_stale_ms: int = Field(default=1500, description="Threshold for STALE state")
-    disconnected_timeout_ms: int = Field(default=5000, description="Threshold for DISCONNECTED state")
+    # Latency and Staleness Thresholds (milliseconds - Section 12: LIVE <1s, DEGRADED 1-3s, STALE 3-10s, DISCONNECTED >10s)
+    stale_threshold_degraded_ms: int = Field(default=1000, description="Threshold for DEGRADED state")
+    stale_threshold_stale_ms: int = Field(default=3000, description="Threshold for STALE state")
+    disconnected_timeout_ms: int = Field(default=10000, description="Threshold for DISCONNECTED state")
+
+    # Offline Satellite Map Imagery & Sovereign Boundary
+    satellite_mbtiles_path: str = Field(default="data/satellite.mbtiles", description="Path to local MBTiles SQLite database")
+    satellite_tiles_dir: str = Field(default="data/tiles", description="Path to local XYZ tile directory")
+    soi_boundary_path: str = Field(default="data/assets/map/india_boundary_soi.geojson", description="Path to Survey of India sovereign boundary GeoJSON")
 
     @field_validator("gcs_ip", "drone_ip")
     @classmethod

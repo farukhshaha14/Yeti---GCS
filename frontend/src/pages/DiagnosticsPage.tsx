@@ -241,6 +241,13 @@ export const DiagnosticsPage: React.FC = () => {
                 Inject Corrupt Bytes
               </button>
               <button
+                onClick={() => handleInjectFault('out_of_order')}
+                disabled={!simStatus?.is_active}
+                className="py-1.5 px-2 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-cyan-400 transition"
+              >
+                Inject Out-of-Order
+              </button>
+              <button
                 onClick={() => handleInjectFault('disconnect')}
                 disabled={!simStatus?.is_active}
                 className="py-1.5 px-2 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-amber-400 transition"
@@ -250,7 +257,7 @@ export const DiagnosticsPage: React.FC = () => {
               <button
                 onClick={() => handleInjectFault('reconnect')}
                 disabled={!simStatus?.is_active}
-                className="py-1.5 px-2 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-emerald-400 transition"
+                className="py-1.5 px-2 rounded bg-slate-800 hover:bg-slate-700 disabled:opacity-40 text-emerald-400 transition col-span-2"
               >
                 Simulate Reconnect
               </button>

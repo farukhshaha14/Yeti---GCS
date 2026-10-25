@@ -81,6 +81,38 @@ export const OperatorControlPanel: React.FC = () => {
         description: 'Emergency stop mission execution and command flight controller to initiate immediate precision land.',
         isDangerous: true,
       });
+    } else if (command === 'CRUISE') {
+      setConfirmDialog({
+        isOpen: true,
+        command: 'CRUISE',
+        title: 'SWITCH TO CRUISE MODE',
+        description: 'Autopilot will accelerate and maintain configured flight cruise speed (15 m/s).',
+        isDangerous: false,
+      });
+    } else if (command === 'LOITER') {
+      setConfirmDialog({
+        isOpen: true,
+        command: 'LOITER',
+        title: 'ENGAGE LOITER / HOVER',
+        description: 'Aircraft will halt forward travel and hold steady GPS position and altitude.',
+        isDangerous: false,
+      });
+    } else if (command === 'DESCEND') {
+      setConfirmDialog({
+        isOpen: true,
+        command: 'DESCEND',
+        title: 'DESCEND FLIGHT ALTITUDE',
+        description: 'Command autopilot to initiate 10m controlled altitude reduction.',
+        isDangerous: false,
+      });
+    } else if (command === 'TAKEOFF') {
+      setConfirmDialog({
+        isOpen: true,
+        command: 'TAKEOFF',
+        title: 'COMMAND AUTONOMOUS TAKEOFF',
+        description: 'Autopilot will spool up motors and climb to configured 15m safe holding altitude.',
+        isDangerous: true,
+      });
     }
   };
 
@@ -196,6 +228,42 @@ export const OperatorControlPanel: React.FC = () => {
           className="py-2 px-2.5 rounded bg-red-950/80 hover:bg-red-900 text-red-200 border border-red-500/50 font-bold text-xs flex items-center justify-center gap-1.5 transition active:scale-95"
         >
           <AlertOctagon className="w-3.5 h-3.5 text-red-400" /> ABORT
+        </button>
+      </div>
+
+      {/* Secondary Tactical & Down Flight Controls */}
+      <div className="grid grid-cols-4 gap-1.5 mb-3 font-mono text-[11px]">
+        <button
+          onClick={() => openConfirmation('TAKEOFF')}
+          disabled={submitting || !isArmed}
+          className="py-1.5 px-2 rounded bg-slate-800 hover:bg-slate-700 text-cyan-300 border border-cyan-500/30 font-bold flex items-center justify-center gap-1 transition active:scale-95 disabled:opacity-40"
+          title="Autonomous Takeoff (15m)"
+        >
+          TAKEOFF
+        </button>
+        <button
+          onClick={() => openConfirmation('CRUISE')}
+          disabled={submitting}
+          className="py-1.5 px-2 rounded bg-cyan-950/70 hover:bg-cyan-900 text-cyan-200 border border-cyan-500/40 font-bold flex items-center justify-center gap-1 transition active:scale-95"
+          title="Switch to Cruise Profile (15 m/s)"
+        >
+          CRUISE
+        </button>
+        <button
+          onClick={() => openConfirmation('LOITER')}
+          disabled={submitting}
+          className="py-1.5 px-2 rounded bg-amber-950/70 hover:bg-amber-900 text-amber-200 border border-amber-500/40 font-bold flex items-center justify-center gap-1 transition active:scale-95"
+          title="Hold current position and altitude"
+        >
+          LOITER
+        </button>
+        <button
+          onClick={() => openConfirmation('DESCEND')}
+          disabled={submitting}
+          className="py-1.5 px-2 rounded bg-rose-950/70 hover:bg-rose-900 text-rose-200 border border-rose-500/40 font-bold flex items-center justify-center gap-1 transition active:scale-95"
+          title="Controlled 10m descent step"
+        >
+          DESCEND
         </button>
       </div>
 

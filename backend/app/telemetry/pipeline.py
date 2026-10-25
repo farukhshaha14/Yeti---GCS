@@ -18,8 +18,10 @@ from app.database.models import (
     TelemetryEvent,
     ConnectionEvent,
     CommandLog,
+    Mission,
     current_time_ms,
 )
+from pymavlink.dialects.v20 import common as mavlink2
 from app.database.session import AsyncSessionLocal
 from app.mavlink.parser import (
     MavlinkParser,
@@ -34,6 +36,7 @@ from app.models.telemetry import (
     VelocityData,
     BatteryData,
     GpsData,
+    NavigationData,
     FlightData,
     DataHealth,
 )
@@ -42,6 +45,32 @@ from app.transport.base import TelemetryTransport
 from app.websocket.manager import get_ws_manager
 
 logger = logging.getLogger("vegapilot.pipeline")
+
+
+def calculate_distance_and_bearing(
+    lat1: float, lon1: float, lat2: float, lon2: float
+) -> Tuple[float, float]:
+    """Calculate geodesic distance in meters (haversine) and initial bearing in degrees
+    from (lat1, lon1) to (lat2, lon2).
+    """
+    R = 6371000.0  # Earth's radius in meters
+    phi1 = math.radians(lat1)
+    phi2 = math.radians(lat2)
+    delta_phi = math.radians(lat2 - lat1)
+    delta_lambda = math.radians(lon2 - lon1)
+
+    a = (math.sin(delta_phi / 2.0) ** 2 +
+         math.cos(phi1) * math.cos(phi2) * (math.sin(delta_lambda / 2.0) ** 2))
+    c = 2.0 * math.atan2(math.sqrt(a), math.sqrt(max(0.0, 1.0 - a)))
+    dist_m = round(R * c, 1)
+
+    y = math.sin(delta_lambda) * math.cos(phi2)
+    x = (math.cos(phi1) * math.sin(phi2) -
+         math.sin(phi1) * math.cos(phi2) * math.cos(delta_lambda))
+    theta = math.atan2(y, x)
+    bearing_deg = round((math.degrees(theta) + 360.0) % 360.0, 1)
+
+    return dist_m, bearing_deg
 
 
 class TelemetryPipeline:
@@ -77,6 +106,8 @@ class TelemetryPipeline:
         self._health_monitor_task: Optional[asyncio.Task] = None
         self._last_sender_addr: Optional[Tuple[str, int]] = None
         self._is_active: bool = False
+        self._last_ws_broadcast_time: float = 0.0
+        self._last_cmd_timeout_check_ms: int = 0
 
         # Hook up recovery sender to transport
         self.reliability.set_recovery_sender(self._send_recovery_request)
@@ -88,6 +119,24 @@ class TelemetryPipeline:
         self._battery_warned_low: bool = False
         self._battery_warned_crit: bool = False
         self._prev_conn_status: str = "DISCONNECTED"
+
+        # Telemetry Session Replay state
+        self._replay_task: Optional[asyncio.Task] = None
+        self._replay_state: Dict[str, Any] = {
+            "is_replaying": False,
+            "mission_id": None,
+            "current": 0,
+            "total": 0,
+            "speed": 1.0,
+        }
+
+        # MAVLink Mission Protocol state
+        self._pending_mission_wps: List[Dict[str, Any]] = []
+        self._upload_future: Optional[asyncio.Future] = None
+        self._mission_upload_state: str = "IDLE"
+        self._download_future: Optional[asyncio.Future] = None
+        self._downloaded_wps: List[Dict[str, Any]] = []
+        self._download_total: int = 0
 
     async def start(self) -> None:
         """Initialize workers and start listening."""
@@ -108,19 +157,154 @@ class TelemetryPipeline:
         self._is_active = False
         await self.transport.stop()
 
-        for task in (self._worker_task, self._db_task, self._health_monitor_task):
-            if task and not task.done():
-                task.cancel()
+        tasks = [t for t in (self._worker_task, self._db_task, self._health_monitor_task) if t and not t.done()]
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            await asyncio.gather(*tasks, return_exceptions=True)
 
         logger.info("Telemetry Pipeline stopped.")
 
     async def set_active_mission(self, new_mission_id: str) -> None:
-        """Switch active mission ID."""
+        """Switch active mission ID and atomically reset state."""
         self.mission_id = new_mission_id
         self.reliability = TelemetryReliabilityEngine(mission_id=new_mission_id)
         self.reliability.set_recovery_sender(self._send_recovery_request)
         self.reliability.register_gap_callback(self._on_gap_status_change)
-        logger.info(f"Switched active mission to: {new_mission_id}")
+
+        # Reset normalized runtime state cleanly
+        self.latest_state = NormalizedTelemetry(
+            drone_id=self.settings.drone_id,
+            received_at=0,
+            processed_at=0,
+        )
+        self._prev_armed = None
+        self._prev_flight_mode = None
+        self._prev_conn_status = "DISCONNECTED"
+        self._battery_warned_low = False
+        self._battery_warned_crit = False
+
+        # Drain any residual packet queue
+        while not self.packet_queue.empty():
+            try:
+                self.packet_queue.get_nowait()
+                self.packet_queue.task_done()
+            except Exception:
+                break
+
+        # Broadcast MISSION_RESET over WebSocket so all clients clear their tracks
+        await self.ws_manager.broadcast({
+            "type": "MISSION_RESET",
+            "mission_id": new_mission_id,
+            "telemetry": self.latest_state.model_dump(),
+        })
+        logger.info(f"Switched active mission to: {new_mission_id} (State and tracks cleanly reset)")
+
+    async def rebind_transport(
+        self,
+        bind_host: Optional[str] = None,
+        bind_port: Optional[int] = None,
+        target_host: Optional[str] = None,
+        target_port: Optional[int] = None,
+    ) -> Dict[str, Any]:
+        """Dynamically rebinds UDP transport."""
+        if hasattr(self.transport, "rebind"):
+            await self.transport.rebind(
+                bind_host=bind_host,
+                bind_port=bind_port,
+                default_target_host=target_host,
+                default_target_port=target_port,
+            )
+            return self.transport.get_stats()
+        return {}
+
+    async def start_replay(self, mission_id: str, speed: float = 1.0) -> Dict[str, Any]:
+        """Replay historical flight packets from SQLite back into the pipeline."""
+        if self._replay_task and not self._replay_task.done():
+            self._replay_task.cancel()
+
+        self._replay_state = {
+            "is_replaying": True,
+            "mission_id": mission_id,
+            "current": 0,
+            "total": 0,
+            "speed": max(0.1, speed),
+        }
+        self._replay_task = asyncio.create_task(self._replay_worker(mission_id, max(0.1, speed)))
+        return self._replay_state
+
+    async def stop_replay(self) -> Dict[str, Any]:
+        """Stops an active telemetry replay."""
+        if self._replay_task and not self._replay_task.done():
+            self._replay_task.cancel()
+        self._replay_state["is_replaying"] = False
+        await self.ws_manager.broadcast({
+            "type": "REPLAY_STATUS",
+            "replay": self._replay_state,
+        })
+        return self._replay_state
+
+    def get_replay_status(self) -> Dict[str, Any]:
+        return self._replay_state
+
+    async def _replay_worker(self, mission_id: str, speed: float) -> None:
+        try:
+            async with AsyncSessionLocal() as session:
+                res = await session.execute(
+                    select(TelemetryPacket)
+                    .where(TelemetryPacket.mission_id == mission_id, TelemetryPacket.is_valid == True)
+                    .order_by(TelemetryPacket.received_at.asc())
+                )
+                packets = res.scalars().all()
+
+            total = len(packets)
+            self._replay_state["total"] = total
+            if total == 0:
+                self._replay_state["is_replaying"] = False
+                await self.ws_manager.broadcast({"type": "REPLAY_STATUS", "replay": self._replay_state})
+                return
+
+            delay = max(0.01, (1.0 / 15.0) / speed)
+            for idx, pkt in enumerate(packets):
+                self._replay_state["current"] = idx + 1
+                try:
+                    payload = json.loads(pkt.payload_json) if pkt.payload_json else {}
+                except Exception:
+                    payload = {}
+
+                # Update normalized state
+                self._update_normalized_state(
+                    msg_type=pkt.message_type,
+                    msg_dict=payload,
+                    source_seq=pkt.source_sequence,
+                    recv_seq=pkt.receive_sequence,
+                    source_ts=pkt.source_timestamp,
+                    recv_ms=pkt.received_at,
+                    proc_ms=pkt.processed_at,
+                )
+                self.latest_state.data_health.status = "LIVE"
+
+                # Broadcast tick and replay progress
+                await self._broadcast_telemetry_tick()
+                if (idx % 5 == 0) or (idx == total - 1):
+                    await self.ws_manager.broadcast({
+                        "type": "REPLAY_STATUS",
+                        "replay": self._replay_state,
+                    })
+
+                await asyncio.sleep(delay)
+
+            self._replay_state["is_replaying"] = False
+            await self.ws_manager.broadcast({
+                "type": "REPLAY_STATUS",
+                "replay": self._replay_state,
+            })
+            logger.info(f"Completed replay of mission {mission_id} ({total} packets)")
+        except asyncio.CancelledError:
+            self._replay_state["is_replaying"] = False
+        except Exception as e:
+            logger.error(f"Error during replay: {e}")
+            self._replay_state["is_replaying"] = False
 
     async def _on_raw_packet_received(
         self, data: bytes, sender_addr: Tuple[str, int], recv_ms: int
@@ -171,6 +355,22 @@ class TelemetryPipeline:
                         cmd_ack_id = msg_dict.get("command", 0)
                         cmd_ack_res = msg_dict.get("result", 0)
                         await self._handle_command_ack(cmd_ack_id, cmd_ack_res, recv_ms)
+
+                    # Handle MAVLink Mission Protocol messages
+                    elif msg_type in ("MISSION_REQUEST", "MISSION_REQUEST_INT") and isinstance(msg_dict, dict):
+                        req_seq = msg_dict.get("seq", 0)
+                        await self._handle_mission_request(req_seq)
+
+                    elif msg_type == "MISSION_ACK" and isinstance(msg_dict, dict):
+                        ack_type = msg_dict.get("type", 0)
+                        await self._handle_mission_ack(ack_type)
+
+                    elif msg_type == "MISSION_COUNT" and isinstance(msg_dict, dict):
+                        count = msg_dict.get("count", 0)
+                        await self._handle_mission_count_download(count)
+
+                    elif msg_type in ("MISSION_ITEM", "MISSION_ITEM_INT") and isinstance(msg_dict, dict):
+                        await self._handle_mission_item_download(msg_dict)
 
                     # Extract sequence and timestamp
                     # Check if payload contains extended monotonic source sequence
@@ -240,8 +440,11 @@ class TelemetryPipeline:
                     except asyncio.QueueFull:
                         pass
 
-                # Broadcast live state update over WebSocket
-                await self._broadcast_telemetry_tick()
+                # Broadcast live state update over WebSocket (throttled to max 25Hz to eliminate CPU serialization lag)
+                now_tick = time.monotonic()
+                if now_tick - self._last_ws_broadcast_time >= 0.040:
+                    self._last_ws_broadcast_time = now_tick
+                    await self._broadcast_telemetry_tick()
                 self.packet_queue.task_done()
             except asyncio.CancelledError:
                 break
@@ -350,10 +553,39 @@ class TelemetryPipeline:
             self.latest_state.attitude.yaw_deg = round((rad_to_deg(msg_dict.get("yaw", 0.0)) + 360.0) % 360.0, 1)
 
         elif msg_type == "GLOBAL_POSITION_INT":
-            self.latest_state.position.latitude = round(msg_dict.get("lat", 0) / 1e7, 7)
-            self.latest_state.position.longitude = round(msg_dict.get("lon", 0) / 1e7, 7)
-            self.latest_state.position.altitude_m = round(msg_dict.get("alt", 0) / 1000.0, 2)
-            self.latest_state.position.relative_altitude_m = round(msg_dict.get("relative_alt", 0) / 1000.0, 2)
+            raw_lat = msg_dict.get("lat", 0)
+            raw_lon = msg_dict.get("lon", 0)
+            lat = round(raw_lat / 1e7, 7)
+            lon = round(raw_lon / 1e7, 7)
+            alt = round(msg_dict.get("alt", 0) / 1000.0, 2)
+            rel_alt = round(msg_dict.get("relative_alt", 0) / 1000.0, 2)
+            hdg_cdeg = msg_dict.get("hdg", 65535)
+
+            # Strict GPS Coordinate Range Validation (-90..90, -180..180, non-zero)
+            if -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0 and (raw_lat != 0 or raw_lon != 0):
+                self.latest_state.position.latitude = lat
+                self.latest_state.position.longitude = lon
+                self.latest_state.position.altitude_m = alt
+                self.latest_state.position.relative_altitude_m = rel_alt
+
+                # Central authoritative GPS data model
+                self.latest_state.gps.latitude = lat
+                self.latest_state.gps.longitude = lon
+                self.latest_state.gps.altitude_m = alt
+                self.latest_state.gps.relative_altitude_m = rel_alt
+                if hdg_cdeg != 65535:
+                    self.latest_state.gps.heading_deg = round(hdg_cdeg / 100.0, 1)
+                elif self.latest_state.attitude.yaw_deg is not None:
+                    self.latest_state.gps.heading_deg = self.latest_state.attitude.yaw_deg
+
+                self.latest_state.gps.valid = True
+                self.latest_state.gps.is_stale = False
+                self.latest_state.gps.last_update_ms = recv_ms
+                if not self.latest_state.gps.gps_fix:
+                    self.latest_state.gps.gps_fix = True
+                    if self.latest_state.gps.fix_status == "NO_FIX":
+                        self.latest_state.gps.fix_status = "3D_FIX"
+
             vx = msg_dict.get("vx", 0) / 100.0
             vy = msg_dict.get("vy", 0) / 100.0
             vz = msg_dict.get("vz", 0) / 100.0
@@ -361,8 +593,94 @@ class TelemetryPipeline:
             self.latest_state.velocity.vertical_speed_mps = round(-vz, 2)
 
         elif msg_type == "GPS_RAW_INT":
-            self.latest_state.gps.fix_type = msg_dict.get("fix_type")
-            self.latest_state.gps.satellites = msg_dict.get("satellites_visible")
+            fix_type = msg_dict.get("fix_type", 0)
+            sats = msg_dict.get("satellites_visible")
+            if sats == 255:
+                sats = None
+            eph = msg_dict.get("eph")
+            epv = msg_dict.get("epv")
+            hdop = round(eph / 100.0, 2) if (eph is not None and eph != 65535 and eph > 0) else None
+            vdop = round(epv / 100.0, 2) if (epv is not None and epv != 65535 and epv > 0) else None
+            time_usec = msg_dict.get("time_usec", 0)
+            raw_lat = msg_dict.get("lat", 0)
+            raw_lon = msg_dict.get("lon", 0)
+            alt = round(msg_dict.get("alt", 0) / 1000.0, 2)
+            cog_cdeg = msg_dict.get("cog", 65535)
+
+            fix_map = {
+                0: "NO_FIX",
+                1: "NO_FIX",
+                2: "2D_FIX",
+                3: "3D_FIX",
+                4: "DGPS",
+                5: "RTK_FLOAT",
+                6: "RTK_FIXED",
+            }
+            self.latest_state.gps.fix_type = fix_type
+            self.latest_state.gps.gps_fix = bool(fix_type >= 2)
+            self.latest_state.gps.fix_status = fix_map.get(fix_type, f"FIX_{fix_type}")
+            self.latest_state.gps.satellites = sats
+            self.latest_state.gps.hdop = hdop
+            self.latest_state.gps.vdop = vdop
+            if time_usec and time_usec > 0:
+                self.latest_state.gps.timestamp = int(time_usec / 1000)
+
+            lat = round(raw_lat / 1e7, 7)
+            lon = round(raw_lon / 1e7, 7)
+            if fix_type >= 2 and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0 and (raw_lat != 0 or raw_lon != 0):
+                self.latest_state.gps.latitude = lat
+                self.latest_state.gps.longitude = lon
+                self.latest_state.gps.altitude_m = alt
+                self.latest_state.gps.valid = True
+                self.latest_state.gps.is_stale = False
+                self.latest_state.gps.last_update_ms = recv_ms
+                if cog_cdeg != 65535:
+                    self.latest_state.gps.heading_deg = round(cog_cdeg / 100.0, 1)
+                elif self.latest_state.attitude.yaw_deg is not None and self.latest_state.gps.heading_deg is None:
+                    self.latest_state.gps.heading_deg = self.latest_state.attitude.yaw_deg
+
+                if self.latest_state.position.latitude is None:
+                    self.latest_state.position.latitude = lat
+                    self.latest_state.position.longitude = lon
+                    self.latest_state.position.altitude_m = alt
+
+        elif msg_type == "HOME_POSITION":
+            raw_lat = msg_dict.get("latitude", 0)
+            raw_lon = msg_dict.get("longitude", 0)
+            h_lat = round(raw_lat / 1e7, 7)
+            h_lon = round(raw_lon / 1e7, 7)
+            h_alt = round(msg_dict.get("altitude", 0) / 1000.0, 2)
+            if -90.0 <= h_lat <= 90.0 and -180.0 <= h_lon <= 180.0 and (raw_lat != 0 or raw_lon != 0):
+                self.latest_state.home.latitude = h_lat
+                self.latest_state.home.longitude = h_lon
+                self.latest_state.home.altitude_m = h_alt
+                self.latest_state.home.is_set = True
+                asyncio.create_task(self._persist_home_to_active_mission())
+
+        elif msg_type == "MISSION_CURRENT":
+            curr_seq = msg_dict.get("seq", 0)
+            self.latest_state.mission_progress.current_waypoint = curr_seq
+            self.latest_state.mission_progress.current_seq = curr_seq
+            self.latest_state.mission_progress.next_waypoint = curr_seq + 1
+            self.latest_state.mission_progress.completed_waypoints = max(0, curr_seq)
+            total = self.latest_state.mission_progress.total_seq or self.latest_state.mission_progress.total_waypoints
+            if total > 0:
+                pct = min(100.0, round((curr_seq / total) * 100.0, 1))
+                self.latest_state.mission_progress.progress_percent = pct
+                self.latest_state.mission_progress.progress_pct = pct
+            self.latest_state.mission_progress.mission_state = "ACTIVE"
+            self.latest_state.mission_progress.is_active = True
+
+        elif msg_type == "MISSION_ITEM_REACHED":
+            reached_seq = msg_dict.get("seq", 0)
+            self.latest_state.mission_progress.reached_seq = reached_seq
+            self.latest_state.mission_progress.completed_waypoints = reached_seq + 1
+            total = self.latest_state.mission_progress.total_seq or self.latest_state.mission_progress.total_waypoints
+            if total > 0:
+                pct = min(100.0, round(((reached_seq + 1) / total) * 100.0, 1))
+                self.latest_state.mission_progress.progress_percent = pct
+                self.latest_state.mission_progress.progress_pct = pct
+            asyncio.create_task(self.record_event("WAYPOINT_REACHED", {"sequence": reached_seq}))
 
         elif msg_type == "SYS_STATUS":
             self.latest_state.battery.percentage = msg_dict.get("battery_remaining")
@@ -377,19 +695,69 @@ class TelemetryPipeline:
                 self.latest_state.velocity.ground_speed_mps = round(msg_dict.get("groundspeed", 0.0), 2)
             if self.latest_state.velocity.vertical_speed_mps is None:
                 self.latest_state.velocity.vertical_speed_mps = round(msg_dict.get("climb", 0.0), 2)
+            hdg = msg_dict.get("heading")
+            if hdg is not None and self.latest_state.gps.heading_deg is None:
+                self.latest_state.gps.heading_deg = float(hdg)
 
         elif msg_type == "RECOVERED_TELEMETRY":
             # Merged values from simulator recovery dictionary
-            if "latitude" in msg_dict:
-                self.latest_state.position.latitude = msg_dict["latitude"]
-                self.latest_state.position.longitude = msg_dict["longitude"]
-                self.latest_state.position.altitude_m = msg_dict.get("altitude_m")
+            if "latitude" in msg_dict and msg_dict["latitude"] is not None:
+                lat = float(msg_dict["latitude"])
+                lon = float(msg_dict["longitude"])
+                alt = float(msg_dict.get("altitude_m", 0))
+                self.latest_state.position.latitude = lat
+                self.latest_state.position.longitude = lon
+                self.latest_state.position.altitude_m = alt
+                self.latest_state.gps.latitude = lat
+                self.latest_state.gps.longitude = lon
+                self.latest_state.gps.altitude_m = alt
+                self.latest_state.gps.valid = True
+                self.latest_state.gps.is_stale = False
+                self.latest_state.gps.last_update_ms = recv_ms
+                if not self.latest_state.gps.gps_fix:
+                    self.latest_state.gps.gps_fix = True
+                    self.latest_state.gps.fix_status = "3D_FIX"
             if "roll_deg" in msg_dict:
                 self.latest_state.attitude.roll_deg = msg_dict["roll_deg"]
                 self.latest_state.attitude.pitch_deg = msg_dict["pitch_deg"]
                 self.latest_state.attitude.yaw_deg = msg_dict["yaw_deg"]
+                if self.latest_state.gps.heading_deg is None:
+                    self.latest_state.gps.heading_deg = msg_dict["yaw_deg"]
             if "battery" in msg_dict and isinstance(msg_dict["battery"], dict):
                 self.latest_state.battery.percentage = msg_dict["battery"].get("percentage")
+
+        # Establish Home position on first ARM if not already set
+        if self.latest_state.flight.armed and not self.latest_state.home.is_set:
+            if self.latest_state.gps.valid and self.latest_state.gps.latitude is not None:
+                self.latest_state.home.latitude = self.latest_state.gps.latitude
+                self.latest_state.home.longitude = self.latest_state.gps.longitude
+                self.latest_state.home.altitude_m = self.latest_state.gps.altitude_m
+                self.latest_state.home.is_set = True
+                asyncio.create_task(self._persist_home_to_active_mission())
+
+        # Navigation values derived from verified GPS & Home state
+        hdg = self.latest_state.gps.heading_deg if self.latest_state.gps.heading_deg is not None else self.latest_state.attitude.yaw_deg
+        self.latest_state.navigation.heading_deg = hdg
+        self.latest_state.navigation.ground_speed_mps = self.latest_state.velocity.ground_speed_mps
+
+        drone_lat = self.latest_state.gps.latitude or self.latest_state.position.latitude
+        drone_lon = self.latest_state.gps.longitude or self.latest_state.position.longitude
+        home_lat = self.latest_state.home.latitude
+        home_lon = self.latest_state.home.longitude
+
+        if (
+            drone_lat is not None
+            and drone_lon is not None
+            and self.latest_state.home.is_set
+            and home_lat is not None
+            and home_lon is not None
+        ):
+            d_m, b_deg = calculate_distance_and_bearing(drone_lat, drone_lon, home_lat, home_lon)
+            self.latest_state.navigation.distance_to_home_m = d_m
+            self.latest_state.navigation.bearing_to_home_deg = b_deg
+        else:
+            self.latest_state.navigation.distance_to_home_m = None
+            self.latest_state.navigation.bearing_to_home_deg = None
 
         # Update data health snapshot
         health = self.reliability.get_data_health()
@@ -541,6 +909,260 @@ class TelemetryPipeline:
             "timestamp": now_ms,
         }
 
+    async def _handle_mission_request(self, seq: int) -> None:
+        """Handles MAVLink MISSION_REQUEST / MISSION_REQUEST_INT from autopilot."""
+        if not self._pending_mission_wps or seq < 0 or seq >= len(self._pending_mission_wps):
+            logger.warning(f"Received MISSION_REQUEST for out-of-range seq: {seq}")
+            return
+
+        wp = self._pending_mission_wps[seq]
+        target_addr = self._last_sender_addr or (
+            self.settings.drone_ip,
+            14555 if self.settings.drone_ip in ("127.0.0.1", "localhost") else self.settings.telemetry_port,
+        )
+
+        cmd = mavlink2.MAV_CMD_NAV_WAYPOINT
+        action = str(wp.get("action", wp.get("command", "WAYPOINT"))).upper()
+        if "TAKEOFF" in action:
+            cmd = mavlink2.MAV_CMD_NAV_TAKEOFF
+        elif "LAND" in action:
+            cmd = mavlink2.MAV_CMD_NAV_LAND
+        elif "RTL" in action or "RTH" in action:
+            cmd = mavlink2.MAV_CMD_NAV_RETURN_TO_LAUNCH
+        elif "LOITER" in action or "HOLD" in action:
+            cmd = mavlink2.MAV_CMD_NAV_LOITER_TIME
+
+        item_msg = self.mav_parser.mav.mission_item_int_encode(
+            target_system=1,
+            target_component=1,
+            seq=seq,
+            frame=mavlink2.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+            command=cmd,
+            current=1 if seq == 0 else 0,
+            autocontinue=1,
+            param1=float(wp.get("hold_time", 0.0)),
+            param2=float(wp.get("acceptance_radius", 2.0)),
+            param3=0.0,
+            param4=0.0,
+            x=int(float(wp.get("lat", wp.get("latitude", 0))) * 1e7),
+            y=int(float(wp.get("lon", wp.get("longitude", 0))) * 1e7),
+            z=float(wp.get("alt_m", wp.get("altitude", 25.0))),
+            mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+        )
+        await self.transport.send(item_msg.pack(self.mav_parser.mav), target_addr)
+        logger.info(f"Dispatched MAVLink MISSION_ITEM_INT #{seq} to {target_addr}")
+        await self.ws_manager.broadcast({
+            "type": "MISSION_UPLOAD_STATUS",
+            "status": "UPLOADING",
+            "current_item": seq + 1,
+            "total_items": len(self._pending_mission_wps),
+            "progress_percent": round(((seq + 1) / len(self._pending_mission_wps)) * 100.0, 1),
+        })
+
+    async def _handle_mission_ack(self, ack_type: int) -> None:
+        """Handles MAVLink MISSION_ACK from autopilot."""
+        logger.info(f"Received MAVLink MISSION_ACK from vehicle: code={ack_type}")
+        if self._upload_future and not self._upload_future.done():
+            self._upload_future.set_result(ack_type)
+
+    async def _handle_mission_count_download(self, count: int) -> None:
+        """Handles MAVLink MISSION_COUNT received during mission download."""
+        self._download_total = count
+        self._downloaded_wps = []
+        logger.info(f"Autopilot reports {count} waypoints onboard.")
+        if count == 0:
+            if self._download_future and not self._download_future.done():
+                self._download_future.set_result([])
+            return
+
+        target_addr = self._last_sender_addr or (
+            self.settings.drone_ip,
+            14555 if self.settings.drone_ip in ("127.0.0.1", "localhost") else self.settings.telemetry_port,
+        )
+        req_msg = self.mav_parser.mav.mission_request_int_encode(
+            target_system=1,
+            target_component=1,
+            seq=0,
+            mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+        )
+        await self.transport.send(req_msg.pack(self.mav_parser.mav), target_addr)
+
+    async def _handle_mission_item_download(self, msg_dict: Dict[str, Any]) -> None:
+        """Handles MAVLink MISSION_ITEM or MISSION_ITEM_INT during download."""
+        seq = msg_dict.get("seq", 0)
+        raw_x = msg_dict.get("x", 0)
+        raw_y = msg_dict.get("y", 0)
+        lat = raw_x / 1e7 if abs(raw_x) > 1000 else raw_x
+        lon = raw_y / 1e7 if abs(raw_y) > 1000 else raw_y
+        alt_m = float(msg_dict.get("z", 25.0))
+        cmd = msg_dict.get("command", 16)
+        action_map = {16: "WAYPOINT", 22: "TAKEOFF", 21: "LAND", 20: "RTL", 19: "LOITER"}
+        action = action_map.get(cmd, "WAYPOINT")
+
+        wp_item = {
+            "id": seq + 1,
+            "lat": round(lat, 7),
+            "lon": round(lon, 7),
+            "alt_m": round(alt_m, 1),
+            "command": action,
+            "action": action,
+        }
+        self._downloaded_wps.append(wp_item)
+
+        target_addr = self._last_sender_addr or (
+            self.settings.drone_ip,
+            14555 if self.settings.drone_ip in ("127.0.0.1", "localhost") else self.settings.telemetry_port,
+        )
+
+        next_seq = seq + 1
+        if next_seq < self._download_total:
+            req_msg = self.mav_parser.mav.mission_request_int_encode(
+                target_system=1,
+                target_component=1,
+                seq=next_seq,
+                mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+            )
+            await self.transport.send(req_msg.pack(self.mav_parser.mav), target_addr)
+        else:
+            ack_msg = self.mav_parser.mav.mission_ack_encode(
+                target_system=1,
+                target_component=1,
+                type=mavlink2.MAV_MISSION_ACCEPTED,
+                mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+            )
+            await self.transport.send(ack_msg.pack(self.mav_parser.mav), target_addr)
+            if self._download_future and not self._download_future.done():
+                self._download_future.set_result(self._downloaded_wps)
+
+    async def upload_mission_mavlink(
+        self, waypoints: List[Dict[str, Any]], target_addr: Optional[Tuple[str, int]] = None
+    ) -> Dict[str, Any]:
+        """Dispatches an authentic MAVLink mission upload sequence to the autopilot."""
+        if not waypoints:
+            raise ValueError("Mission contains 0 waypoints")
+
+        self._pending_mission_wps = waypoints
+        self._upload_future = asyncio.get_event_loop().create_future()
+        self._mission_upload_state = "UPLOADING"
+        self.latest_state.mission_progress.total_seq = len(waypoints)
+
+        target_addr = target_addr or self._last_sender_addr or (
+            self.settings.drone_ip,
+            14555 if self.settings.drone_ip in ("127.0.0.1", "localhost") else self.settings.telemetry_port,
+        )
+        self._last_sender_addr = target_addr
+
+        await self.ws_manager.broadcast({
+            "type": "MISSION_UPLOAD_STATUS",
+            "status": "UPLOAD_STARTED",
+            "message": f"Initiating MAVLink mission upload ({len(waypoints)} waypoints)...",
+            "waypoint_count": len(waypoints),
+        })
+
+        # Send MISSION_COUNT
+        count_msg = self.mav_parser.mav.mission_count_encode(
+            target_system=1,
+            target_component=1,
+            count=len(waypoints),
+            mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+        )
+        await self.transport.send(count_msg.pack(self.mav_parser.mav), target_addr)
+        logger.info(f"Dispatched MAVLink MISSION_COUNT ({len(waypoints)}) to {target_addr}")
+
+        try:
+            ack_code = await asyncio.wait_for(self._upload_future, timeout=5.0)
+            if ack_code == mavlink2.MAV_MISSION_ACCEPTED:
+                self._mission_upload_state = "UPLOADED"
+                self.latest_state.mission_progress.mission_state = "LOADED"
+                await self._persist_mission_upload_status("UPLOADED")
+                await self.ws_manager.broadcast({
+                    "type": "MISSION_UPLOAD_STATUS",
+                    "status": "ACKNOWLEDGED",
+                    "message": "Autopilot acknowledged mission upload successfully.",
+                    "waypoint_count": len(waypoints),
+                })
+                await self.record_event("MISSION_UPLOAD_ACKNOWLEDGED", {"waypoint_count": len(waypoints)})
+                return {"status": "ACKNOWLEDGED", "waypoint_count": len(waypoints), "message": "Mission uploaded and acknowledged by autopilot."}
+            else:
+                self._mission_upload_state = "FAILED"
+                await self._persist_mission_upload_status("FAILED")
+                await self.ws_manager.broadcast({
+                    "type": "MISSION_UPLOAD_STATUS",
+                    "status": "UPLOAD_FAILED",
+                    "message": f"Autopilot rejected mission with ACK code: {ack_code}",
+                })
+                return {"status": "UPLOAD_FAILED", "ack_code": ack_code, "message": f"Autopilot rejected mission: {ack_code}"}
+        except asyncio.TimeoutError:
+            self._mission_upload_state = "FAILED"
+            await self._persist_mission_upload_status("FAILED")
+            await self.ws_manager.broadcast({
+                "type": "MISSION_UPLOAD_STATUS",
+                "status": "UPLOAD_FAILED",
+                "message": "Mission upload timed out waiting for vehicle ACK.",
+            })
+            return {"status": "UPLOAD_FAILED", "error": "TIMEOUT", "message": "Upload timed out waiting for vehicle acknowledgement."}
+
+    async def download_mission_mavlink(
+        self, target_addr: Optional[Tuple[str, int]] = None
+    ) -> List[Dict[str, Any]]:
+        """Requests active mission from autopilot via MAVLink MISSION_REQUEST_LIST."""
+        self._download_future = asyncio.get_event_loop().create_future()
+        self._downloaded_wps = []
+        self._download_total = 0
+
+        target_addr = target_addr or self._last_sender_addr or (
+            self.settings.drone_ip,
+            14555 if self.settings.drone_ip in ("127.0.0.1", "localhost") else self.settings.telemetry_port,
+        )
+        self._last_sender_addr = target_addr
+
+        req_list_msg = self.mav_parser.mav.mission_request_list_encode(
+            target_system=1,
+            target_component=1,
+            mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+        )
+        await self.transport.send(req_list_msg.pack(self.mav_parser.mav), target_addr)
+        logger.info(f"Dispatched MAVLink MISSION_REQUEST_LIST to {target_addr}")
+
+        try:
+            wps = await asyncio.wait_for(self._download_future, timeout=5.0)
+            return wps
+        except asyncio.TimeoutError:
+            logger.warning("Mission download timed out waiting for vehicle.")
+            return []
+
+    async def _persist_home_to_active_mission(self) -> None:
+        """Stores confirmed home coordinates in SQLite for current mission."""
+        if not self.latest_state.home.is_set or self.latest_state.home.latitude is None:
+            return
+        async with AsyncSessionLocal() as session:
+            try:
+                res = await session.execute(select(Mission).where(Mission.mission_id == self.mission_id))
+                m = res.scalar_one_or_none()
+                if m:
+                    m.home_lat = self.latest_state.home.latitude
+                    m.home_lon = self.latest_state.home.longitude
+                    m.home_alt = self.latest_state.home.altitude_m
+                    m.updated_at = current_time_ms()
+                    await session.commit()
+            except Exception as e:
+                logger.error(f"Error persisting home position: {e}")
+
+    async def _persist_mission_upload_status(self, status: str) -> None:
+        """Stores mission upload status and timestamp in SQLite."""
+        async with AsyncSessionLocal() as session:
+            try:
+                res = await session.execute(select(Mission).where(Mission.mission_id == self.mission_id))
+                m = res.scalar_one_or_none()
+                if m:
+                    m.upload_status = status
+                    m.updated_at = current_time_ms()
+                    if status == "UPLOADED":
+                        m.upload_acknowledged_at = current_time_ms()
+                    await session.commit()
+            except Exception as e:
+                logger.error(f"Error persisting mission upload status: {e}")
+
     async def _send_recovery_request(self, missing_sequences: List[int]) -> None:
         """Dispatches an application recovery retransmission request to the sender."""
         target_addr = self._last_sender_addr or (
@@ -614,6 +1236,16 @@ class TelemetryPipeline:
                         asyncio.create_task(self.record_event("COMMUNICATION_LOST", {"status": curr_status, "age_ms": health.last_packet_age_ms}))
                     self._prev_conn_status = curr_status
 
+                # GPS Staleness & Loss Evaluation (Section 25)
+                now_ms = current_time_ms()
+                last_gps_ms = self.latest_state.gps.last_update_ms
+                if last_gps_ms:
+                    gps_age_ms = now_ms - last_gps_ms
+                    if gps_age_ms > self.settings.stale_threshold_stale_ms:
+                        self.latest_state.gps.is_stale = True
+                    if gps_age_ms > self.settings.disconnected_timeout_ms:
+                        self.latest_state.gps.valid = False
+
                 # If connection dropped or degraded, notify UI immediately
                 if health.status in ("DEGRADED", "STALE", "DISCONNECTED"):
                     await self.ws_manager.broadcast({
@@ -621,6 +1253,37 @@ class TelemetryPipeline:
                         "mission_id": self.mission_id,
                         "data_health": health.model_dump(),
                     })
+
+                # Check for unacknowledged command timeouts (> 5000ms pending without ACK)
+                if now_ms - self._last_cmd_timeout_check_ms >= 1000:
+                    self._last_cmd_timeout_check_ms = now_ms
+                    try:
+                        async with AsyncSessionLocal() as session:
+                            timed_out_cmds = (await session.execute(
+                                select(CommandLog)
+                                .where(
+                                    CommandLog.mission_id == self.mission_id,
+                                    CommandLog.status == "SENT",
+                                    CommandLog.timestamp < (now_ms - 5000),
+                                )
+                            )).scalars().all()
+
+                            if timed_out_cmds:
+                                for cmd in timed_out_cmds:
+                                    cmd.status = "TIMEOUT"
+                                    cmd.details = "No COMMAND_ACK received within 5000ms timeout"
+                                    await self.ws_manager.broadcast({
+                                        "type": "COMMAND_STATUS",
+                                        "id": cmd.id,
+                                        "command_name": cmd.command_name,
+                                        "command_id": cmd.command_id,
+                                        "status": "TIMEOUT",
+                                        "timestamp": now_ms,
+                                    })
+                                await session.commit()
+                    except Exception as e:
+                        logger.debug(f"Error checking command timeouts: {e}")
+
             except asyncio.CancelledError:
                 break
             except Exception as e:
@@ -628,7 +1291,8 @@ class TelemetryPipeline:
 
     async def _persistence_worker(self) -> None:
         """Asynchronous database batch persistence worker.
-        Batches database inserts to ensure zero receiver thread contention.
+        Batches database inserts over a 100ms window (up to 60 packets) to drastically
+        reduce SQLite transactions and eliminate disk thrashing.
         """
         while self._is_active:
             batch: List[Dict[str, Any]] = []
@@ -639,9 +1303,19 @@ class TelemetryPipeline:
                     break
                 batch.append(item)
 
-                # Drain up to 100 more items immediately available in queue
-                while len(batch) < 100 and not self.persistence_queue.empty():
-                    batch.append(self.persistence_queue.get_nowait())
+                # Collect incoming items over up to 100ms window to bundle transactions
+                deadline = time.monotonic() + 0.10
+                while len(batch) < 60:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        break
+                    try:
+                        next_item = await asyncio.wait_for(self.persistence_queue.get(), timeout=remaining)
+                        if next_item is None:
+                            break
+                        batch.append(next_item)
+                    except (asyncio.TimeoutError, TimeoutError):
+                        break
 
                 # Batch write to SQLite
                 async with AsyncSessionLocal() as session:
@@ -674,6 +1348,9 @@ class TelemetryPipeline:
                             battery_current_a=self.latest_state.battery.current_a,
                             gps_fix_type=self.latest_state.gps.fix_type,
                             gps_satellites=self.latest_state.gps.satellites,
+                            hdop=self.latest_state.gps.hdop,
+                            vdop=self.latest_state.gps.vdop,
+                            heading_deg=self.latest_state.navigation.heading_deg,
                             flight_armed=self.latest_state.flight.armed,
                             flight_mode=self.latest_state.flight.mode,
                             last_source_sequence=self.latest_state.source_sequence,
@@ -698,6 +1375,9 @@ class TelemetryPipeline:
                         state_row.battery_current_a = self.latest_state.battery.current_a
                         state_row.gps_fix_type = self.latest_state.gps.fix_type
                         state_row.gps_satellites = self.latest_state.gps.satellites
+                        state_row.hdop = self.latest_state.gps.hdop
+                        state_row.vdop = self.latest_state.gps.vdop
+                        state_row.heading_deg = self.latest_state.navigation.heading_deg
                         state_row.flight_armed = self.latest_state.flight.armed
                         state_row.flight_mode = self.latest_state.flight.mode
                         state_row.last_source_sequence = self.latest_state.source_sequence

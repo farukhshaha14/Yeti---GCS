@@ -34,8 +34,44 @@ export interface BatteryData {
 }
 
 export interface GpsData {
+  latitude: number | null;
+  longitude: number | null;
+  altitude_m: number | null;
+  relative_altitude_m?: number | null;
+  heading_deg: number | null;
+  gps_fix: boolean;
+  fix_status: string;
   fix_type: number | null;
   satellites: number | null;
+  hdop?: number | null;
+  vdop?: number | null;
+  timestamp: string | null;
+  valid: boolean;
+  last_update_ms: number | null;
+  is_stale: boolean;
+}
+
+export interface NavigationData {
+  heading_deg?: number | null;
+  ground_speed_mps?: number | null;
+  distance_to_home_m?: number | null;
+  bearing_to_home_deg?: number | null;
+}
+
+export interface HomePositionData {
+  latitude?: number | null;
+  longitude?: number | null;
+  altitude_m?: number | null;
+  is_set?: boolean;
+  timestamp?: string | null;
+}
+
+export interface MissionProgressData {
+  current_seq?: number | null;
+  total_seq?: number | null;
+  reached_seq?: number | null;
+  is_active?: boolean;
+  progress_pct?: number;
 }
 
 export interface FlightData {
@@ -73,8 +109,28 @@ export interface NormalizedTelemetry {
   velocity: VelocityData;
   battery: BatteryData;
   gps: GpsData;
+  navigation?: NavigationData;
+  home?: HomePositionData;
+  mission_progress?: MissionProgressData;
   flight: FlightData;
   data_health: DataHealth;
+}
+
+export interface ValidationCheckItem {
+  name: string;
+  passed: boolean;
+  message: string;
+}
+
+export interface MissionValidationResult {
+  mission_id: string;
+  valid: boolean;
+  status: string;
+  waypoint_count: number;
+  checks: ValidationCheckItem[];
+  errors: string[];
+  vehicle_connected: boolean;
+  telemetry_available: boolean;
 }
 
 export interface Mission {
@@ -86,6 +142,12 @@ export interface Mission {
   ended_at: number | null;
   status: "ACTIVE" | "COMPLETED" | "ABORTED";
   packet_count: number;
+  upload_status?: string;
+  upload_acknowledged_at?: number | null;
+  execution_status?: string;
+  home_lat?: number | null;
+  home_lon?: number | null;
+  home_alt?: number | null;
 }
 
 export interface TelemetryPacketItem {
@@ -125,6 +187,8 @@ export interface NetworkConfig {
   stale_threshold_degraded_ms: number;
   stale_threshold_stale_ms: number;
   disconnected_timeout_ms: number;
+  is_configured?: boolean;
+  is_fallback?: boolean;
 }
 
 export interface Waypoint {
@@ -182,4 +246,21 @@ export interface SensorStatusItem {
   type: 'IMU' | 'GNSS' | 'BAROMETER';
   status: 'OK' | 'WARNING' | 'ERROR' | 'NO DATA' | 'UNKNOWN';
   details: string;
+}
+
+export interface CompetitionTemplate {
+  id: string;
+  name: string;
+  description: string;
+  waypoints: Waypoint[];
+  geofence: Array<{ lat: number; lon: number }>;
+  no_fly_zones: Array<Array<{ lat: number; lon: number }>>;
+}
+
+export interface ReplayStatus {
+  is_replaying: boolean;
+  mission_id: string | null;
+  current: number;
+  total: number;
+  speed: number;
 }

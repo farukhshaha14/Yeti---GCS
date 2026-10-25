@@ -32,6 +32,14 @@ class Mission(Base):
     ended_at = Column(BigInteger, nullable=True)
     status = Column(String(32), nullable=False, default="ACTIVE")  # ACTIVE, COMPLETED, ABORTED
     waypoints_json = Column(Text, nullable=True)
+    geofence_json = Column(Text, nullable=True)
+    home_lat = Column(Float, nullable=True)
+    home_lon = Column(Float, nullable=True)
+    home_alt = Column(Float, nullable=True)
+    upload_status = Column(String(32), nullable=False, default="NOT_UPLOADED")  # NOT_UPLOADED, UPLOADING, UPLOADED, FAILED
+    upload_acknowledged_at = Column(BigInteger, nullable=True)
+    execution_status = Column(String(32), nullable=False, default="IDLE")  # IDLE, ACTIVE, COMPLETED, ABORTED
+    updated_at = Column(BigInteger, nullable=False, default=current_time_ms)
     created_at = Column(BigInteger, nullable=False, default=current_time_ms)
 
 
@@ -81,6 +89,9 @@ class TelemetryState(Base):
     battery_current_a = Column(Float, nullable=True)
     gps_fix_type = Column(Integer, nullable=True)
     gps_satellites = Column(Integer, nullable=True)
+    hdop = Column(Float, nullable=True)
+    vdop = Column(Float, nullable=True)
+    heading_deg = Column(Float, nullable=True)
     flight_armed = Column(Boolean, nullable=True)
     flight_mode = Column(String(32), nullable=True)
     last_source_sequence = Column(Integer, nullable=True)

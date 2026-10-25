@@ -7,7 +7,8 @@ from sqlalchemy.ext.asyncio import (
     async_sessionmaker,
     create_async_engine,
 )
-from sqlalchemy import event, text
+from sqlalchemy import text
+from sqlalchemy.pool import NullPool
 from app.config import get_settings
 from app.database.models import Base
 
@@ -19,7 +20,8 @@ os.makedirs("data", exist_ok=True)
 engine = create_async_engine(
     settings.database_url,
     echo=False,
-    connect_args={"check_same_thread": False},
+    poolclass=NullPool,
+    connect_args={"check_same_thread": False, "timeout": 15},
 )
 
 # Async session factory
@@ -39,6 +41,50 @@ async def init_db() -> None:
         await conn.run_sync(Base.metadata.create_all)
         try:
             await conn.execute(text("ALTER TABLE missions ADD COLUMN waypoints_json TEXT;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN geofence_json TEXT;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN home_lat REAL;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN home_lon REAL;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN home_alt REAL;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN upload_status TEXT DEFAULT 'NOT_UPLOADED';"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN upload_acknowledged_at INTEGER;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN execution_status TEXT DEFAULT 'IDLE';"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE missions ADD COLUMN updated_at INTEGER;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE telemetry_state ADD COLUMN hdop REAL;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE telemetry_state ADD COLUMN vdop REAL;"))
+        except Exception:
+            pass
+        try:
+            await conn.execute(text("ALTER TABLE telemetry_state ADD COLUMN heading_deg REAL;"))
         except Exception:
             pass
 

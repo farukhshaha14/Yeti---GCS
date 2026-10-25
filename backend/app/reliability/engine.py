@@ -1,8 +1,5 @@
-"""Reliability and Verification Engine for VEGAPilot GCS.
-Tracks source vs receive sequences, packet gaps, duplicates, out-of-order frames,
-transport/processing latency, jitter, staleness, and dispatches retransmission recovery.
-"""
 import asyncio
+import collections
 import logging
 import math
 import time
@@ -14,7 +11,7 @@ logger = logging.getLogger("vegapilot.reliability")
 
 
 class TelemetryReliabilityEngine:
-    """Manages telemetry integrity verification, gap detection, and recovery."""
+    """Manages telemetry integrity verification, gap detection, wraparound, and recovery."""
 
     def __init__(self, mission_id: str = "DEFAULT-MISSION") -> None:
         self.mission_id = mission_id
@@ -24,7 +21,10 @@ class TelemetryReliabilityEngine:
         self.receive_sequence_counter: int = 0
         self.highest_source_sequence: Optional[int] = None
         self.last_received_source_sequence: Optional[int] = None
-        self._seen_source_sequences: Set[int] = set()
+
+        # Bounded sliding window for seen sequences: O(1) membership, zero memory leak
+        self._seen_deque: collections.deque[int] = collections.deque(maxlen=2048)
+        self._seen_set: Set[int] = set()
 
         # Gap and recovery records
         # Map: seq -> {"detected_at": ms, "status": "MISSING"|"RECOVERING"|"RECOVERED"|"UNRECOVERED", "recovered_at": ms}
@@ -60,6 +60,7 @@ class TelemetryReliabilityEngine:
         is_valid: bool = True,
     ) -> Tuple[int, bool, bool, bool]:
         """Analyzes packet arrival for reliability metrics.
+        Handles sequence wraparound (8-bit 255->0 or 16-bit) and bounded deduplication.
         Returns: (receive_seq, is_duplicate, is_out_of_order, is_recovered)
         """
         self.receive_sequence_counter += 1
@@ -108,30 +109,62 @@ class TelemetryReliabilityEngine:
             for cb in self.gap_callbacks:
                 asyncio.create_task(cb(source_seq, "RECOVERED", received_at_ms))
 
-        # Check for duplicate
-        if source_seq in self._seen_source_sequences:
+        # Check for duplicate within sliding window
+        if source_seq in self._seen_set:
             is_duplicate = True
             self.duplicate_packets_count += 1
             logger.warning(f"[RELIABILITY] Duplicate packet detected: seq #{source_seq}")
             return receive_seq, is_duplicate, is_out_of_order, is_recovered
 
-        self._seen_source_sequences.add(source_seq)
+        # Register in bounded sliding window
+        if len(self._seen_deque) == self._seen_deque.maxlen:
+            oldest = self._seen_deque.popleft()
+            self._seen_set.discard(oldest)
+        self._seen_deque.append(source_seq)
+        self._seen_set.add(source_seq)
 
-        # Check out of order or gap
+        # Check sequence progression, gaps, and wraparounds
         if self.highest_source_sequence is None:
             self.highest_source_sequence = source_seq
         else:
-            if source_seq < self.highest_source_sequence:
+            prev_highest = self.highest_source_sequence
+
+            # Check 8-bit MAVLink sequence wraparound (255 -> 0) or 16-bit wraparound
+            is_wrap_8 = (prev_highest <= 255 and prev_highest >= 192 and source_seq <= 64)
+            is_wrap_16 = (prev_highest <= 65535 and prev_highest >= 65000 and source_seq <= 500)
+
+            if is_wrap_8 or is_wrap_16:
+                mod_base = 256 if is_wrap_8 else 65536
+                gap_count = (source_seq - prev_highest) % mod_base
+                if gap_count > 1:
+                    missing_range = [(prev_highest + i) % mod_base for i in range(1, gap_count)]
+                    logger.warning(
+                        f"[GAP DETECTED (WRAP)] Missing sequences: {missing_range} (highest: #{prev_highest}, incoming: #{source_seq})"
+                    )
+                    for missing_seq in missing_range:
+                        if missing_seq not in self.gaps:
+                            self.gaps[missing_seq] = {
+                                "detected_at": received_at_ms,
+                                "status": "RECOVERING",
+                                "recovered_at": None,
+                            }
+                            for cb in self.gap_callbacks:
+                                asyncio.create_task(cb(missing_seq, "RECOVERING", received_at_ms))
+                    if self.recovery_request_sender:
+                        asyncio.create_task(self.recovery_request_sender(missing_range))
+                self.highest_source_sequence = source_seq
+
+            elif source_seq < prev_highest:
                 is_out_of_order = True
                 self.out_of_order_packets_count += 1
                 logger.warning(
-                    f"[RELIABILITY] Out-of-order packet: #{source_seq} (highest seen was #{self.highest_source_sequence})"
+                    f"[RELIABILITY] Out-of-order packet: #{source_seq} (highest seen was #{prev_highest})"
                 )
-            elif source_seq > self.highest_source_sequence + 1:
-                # Packet Gap Detected!
-                missing_range = list(range(self.highest_source_sequence + 1, source_seq))
+            elif source_seq > prev_highest + 1:
+                # Monotonic sequence gap detected!
+                missing_range = list(range(prev_highest + 1, source_seq))
                 logger.warning(
-                    f"[GAP DETECTED] Missing sequences: {missing_range} (highest: #{self.highest_source_sequence}, incoming: #{source_seq})"
+                    f"[GAP DETECTED] Missing sequences: {missing_range} (highest: #{prev_highest}, incoming: #{source_seq})"
                 )
                 for missing_seq in missing_range:
                     if missing_seq not in self.gaps:
@@ -143,7 +176,6 @@ class TelemetryReliabilityEngine:
                         for cb in self.gap_callbacks:
                             asyncio.create_task(cb(missing_seq, "RECOVERING", received_at_ms))
 
-                # Immediately trigger recovery request if sender configured
                 if self.recovery_request_sender:
                     asyncio.create_task(self.recovery_request_sender(missing_range))
 
@@ -155,23 +187,8 @@ class TelemetryReliabilityEngine:
         return receive_seq, is_duplicate, is_out_of_order, is_recovered
 
     def get_data_health(self) -> DataHealth:
-        """Computes live telemetry health metrics and connection staleness state."""
+        """Computes live telemetry health metrics and connection staleness state compliant with Section 12."""
         now_ms = int(time.time() * 1000)
-
-        # Staleness & Connection State determination
-        if self.last_packet_received_at is None:
-            status = "DISCONNECTED"
-            age_ms = None
-        else:
-            age_ms = max(0, now_ms - self.last_packet_received_at)
-            if age_ms < self.settings.stale_threshold_degraded_ms:
-                status = "LIVE"
-            elif age_ms < self.settings.stale_threshold_stale_ms:
-                status = "DEGRADED"
-            elif age_ms < self.settings.disconnected_timeout_ms:
-                status = "STALE"
-            else:
-                status = "DISCONNECTED"
 
         # Check unrecovered gap timeouts (> 3000ms marked UNRECOVERED)
         for seq, info in self.gaps.items():
@@ -181,7 +198,7 @@ class TelemetryReliabilityEngine:
                     for cb in self.gap_callbacks:
                         asyncio.create_task(cb(seq, "UNRECOVERED", now_ms))
 
-        # Tally gaps
+        # Tally gaps and packet loss
         total_missing_observed = len(self.gaps)
         recovered_count = sum(1 for g in self.gaps.values() if g["status"] == "RECOVERED")
         unrecovered_count = sum(1 for g in self.gaps.values() if g["status"] in ("MISSING", "RECOVERING", "UNRECOVERED"))
@@ -189,6 +206,21 @@ class TelemetryReliabilityEngine:
         # Calculate loss percentage: unrecovered / (received + unrecovered)
         total_expected = self.received_packets_count + unrecovered_count
         loss_pct = (unrecovered_count / total_expected * 100.0) if total_expected > 0 else 0.0
+
+        # Staleness & Connection State determination (Section 12: LIVE <1s, DEGRADED 1-3s or loss>5%, STALE 3-10s, DISCONNECTED >10s)
+        if self.last_packet_received_at is None:
+            status = "DISCONNECTED"
+            age_ms = None
+        else:
+            age_ms = max(0, now_ms - self.last_packet_received_at)
+            if age_ms >= self.settings.disconnected_timeout_ms:
+                status = "DISCONNECTED"
+            elif age_ms >= self.settings.stale_threshold_stale_ms:
+                status = "STALE"
+            elif age_ms >= self.settings.stale_threshold_degraded_ms or loss_pct > 5.0:
+                status = "DEGRADED"
+            else:
+                status = "LIVE"
 
         avg_latency = (
             sum(self.latency_samples) / len(self.latency_samples)

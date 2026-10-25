@@ -40,6 +40,8 @@ class FlightState:
         self.phase = "PREFLIGHT"  # PREFLIGHT, TAKEOFF, CLIMB, CRUISE, DESCENT, LANDING, GROUND
         self.phase_time = 0.0
         self.heading_rad = 0.0
+        self.mission_waypoints: List[Dict[str, Any]] = []
+        self.current_wp_idx: int = 0
 
     def step(self, dt: float = 0.1) -> None:
         self.phase_time += dt
@@ -75,26 +77,55 @@ class FlightState:
                 self.phase_time = 0.0
 
         elif self.phase == "CRUISE":
-            self.vertical_speed_mps = 0.1 * math.sin(self.phase_time)
-            self.ground_speed_mps = 8.5 + 1.2 * math.sin(self.phase_time * 0.5)
-            self.altitude_m += self.vertical_speed_mps * dt
-            self.relative_altitude_m = self.altitude_m
+            if self.mission_waypoints and self.current_wp_idx < len(self.mission_waypoints):
+                target_wp = self.mission_waypoints[self.current_wp_idx]
+                target_lat = float(target_wp.get("lat", target_wp.get("latitude", self.home_lat)))
+                target_lon = float(target_wp.get("lon", target_wp.get("longitude", self.home_lon)))
+                target_alt = float(target_wp.get("alt_m", target_wp.get("altitude", 30.0)))
 
-            # Figure-8 / circle trajectory
-            self.yaw_deg = (self.yaw_deg + 4.0 * dt) % 360.0
-            self.roll_deg = 8.0 * math.sin(self.phase_time * 0.8)
-            self.pitch_deg = -2.0 + 1.5 * math.cos(self.phase_time * 0.5)
-            self.battery_current_a = 12.5 + 2.0 * math.sin(self.phase_time)
+                d_lat = target_lat - self.latitude
+                d_lon = target_lon - self.longitude
+                dist_m = math.sqrt((d_lat * 111000.0) ** 2 + (d_lon * 111000.0 * math.cos(math.radians(self.latitude))) ** 2)
 
-            # Move lat/lon
-            rad = math.radians(self.yaw_deg)
-            # 1 deg lat ~ 111,000m
-            self.latitude += (self.ground_speed_mps * math.cos(rad) * dt) / 111000.0
-            self.longitude += (self.ground_speed_mps * math.sin(rad) * dt) / (111000.0 * math.cos(math.radians(self.latitude)))
+                if dist_m < 5.0:
+                    self.current_wp_idx += 1
+                    logger.info(f"[SIMULATOR] Reached waypoint #{self.current_wp_idx} of {len(self.mission_waypoints)}")
+                    if self.current_wp_idx >= len(self.mission_waypoints):
+                        self.phase = "DESCENT"
+                        self.flight_mode = "RTL"
+                else:
+                    bearing_rad = math.atan2(d_lon * math.cos(math.radians(self.latitude)), d_lat)
+                    self.yaw_deg = (math.degrees(bearing_rad) + 360.0) % 360.0
+                    speed = 10.0
+                    self.ground_speed_mps = speed
+                    self.latitude += (speed * math.cos(bearing_rad) * dt) / 111000.0
+                    self.longitude += (speed * math.sin(bearing_rad) * dt) / (111000.0 * math.cos(math.radians(self.latitude)))
+                    d_alt = target_alt - self.altitude_m
+                    if abs(d_alt) > 0.5:
+                        self.vertical_speed_mps = 1.5 if d_alt > 0 else -1.5
+                        self.altitude_m += self.vertical_speed_mps * dt
+                        self.relative_altitude_m = self.altitude_m
+            else:
+                self.vertical_speed_mps = 0.1 * math.sin(self.phase_time)
+                self.ground_speed_mps = 8.5 + 1.2 * math.sin(self.phase_time * 0.5)
+                self.altitude_m += self.vertical_speed_mps * dt
+                self.relative_altitude_m = self.altitude_m
 
-            if self.phase_time > 40.0:
-                self.phase = "DESCENT"
-                self.phase_time = 0.0
+                # Figure-8 / circle trajectory
+                self.yaw_deg = (self.yaw_deg + 4.0 * dt) % 360.0
+                self.roll_deg = 8.0 * math.sin(self.phase_time * 0.8)
+                self.pitch_deg = -2.0 + 1.5 * math.cos(self.phase_time * 0.5)
+                self.battery_current_a = 12.5 + 2.0 * math.sin(self.phase_time)
+
+                # Move lat/lon
+                rad = math.radians(self.yaw_deg)
+                # 1 deg lat ~ 111,000m
+                self.latitude += (self.ground_speed_mps * math.cos(rad) * dt) / 111000.0
+                self.longitude += (self.ground_speed_mps * math.sin(rad) * dt) / (111000.0 * math.cos(math.radians(self.latitude)))
+
+                if self.phase_time > 40.0:
+                    self.phase = "DESCENT"
+                    self.phase_time = 0.0
 
         elif self.phase == "DESCENT":
             self.battery_current_a = 10.0
@@ -271,6 +302,86 @@ class TelemetrySimulator:
                                 )
                                 self.sock.sendto(ack_msg.pack(self.mav), (self.target_host, self.target_port))
                                 logger.info(f"[SIMULATOR] Transmitted MAVLink COMMAND_ACK for command {cmd} to {self.target_host}:{self.target_port}")
+
+                            elif hasattr(p_msg, "get_type") and p_msg.get_type() == "MISSION_COUNT":
+                                count = getattr(p_msg, "count", 0)
+                                self._sim_target_count = count
+                                self._sim_incoming_wps = []
+                                logger.info(f"[SIMULATOR] Received MISSION_COUNT: {count}. Requesting WP #0")
+                                req_msg = self.mav.mission_request_int_encode(
+                                    target_system=1,
+                                    target_component=1,
+                                    seq=0,
+                                    mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+                                )
+                                self.sock.sendto(req_msg.pack(self.mav), (self.target_host, self.target_port))
+
+                            elif hasattr(p_msg, "get_type") and p_msg.get_type() in ("MISSION_ITEM", "MISSION_ITEM_INT"):
+                                seq = getattr(p_msg, "seq", 0)
+                                raw_x = getattr(p_msg, "x", 0)
+                                raw_y = getattr(p_msg, "y", 0)
+                                lat = raw_x / 1e7 if abs(raw_x) > 1000 else raw_x
+                                lon = raw_y / 1e7 if abs(raw_y) > 1000 else raw_y
+                                alt = getattr(p_msg, "z", 25.0)
+                                cmd = getattr(p_msg, "command", 16)
+                                wp_data = {"id": seq + 1, "lat": lat, "lon": lon, "alt_m": alt, "command": cmd}
+                                if not hasattr(self, "_sim_incoming_wps"):
+                                    self._sim_incoming_wps = []
+                                self._sim_incoming_wps.append(wp_data)
+                                logger.info(f"[SIMULATOR] Stored WP #{seq} (lat={lat:.6f}, lon={lon:.6f}, alt={alt}m)")
+
+                                if seq + 1 < getattr(self, "_sim_target_count", 0):
+                                    req_msg = self.mav.mission_request_int_encode(
+                                        target_system=1,
+                                        target_component=1,
+                                        seq=seq + 1,
+                                        mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+                                    )
+                                    self.sock.sendto(req_msg.pack(self.mav), (self.target_host, self.target_port))
+                                else:
+                                    self.flight.mission_waypoints = self._sim_incoming_wps
+                                    self.flight.current_wp_idx = 0
+                                    ack_msg = self.mav.mission_ack_encode(
+                                        target_system=1,
+                                        target_component=1,
+                                        type=mavlink2.MAV_MISSION_ACCEPTED,
+                                        mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+                                    )
+                                    self.sock.sendto(ack_msg.pack(self.mav), (self.target_host, self.target_port))
+                                    logger.info(f"[SIMULATOR] Mission upload COMPLETE! Loaded {len(self.flight.mission_waypoints)} waypoints.")
+
+                            elif hasattr(p_msg, "get_type") and p_msg.get_type() == "MISSION_REQUEST_LIST":
+                                count = len(self.flight.mission_waypoints)
+                                cnt_msg = self.mav.mission_count_encode(
+                                    target_system=1,
+                                    target_component=1,
+                                    count=count,
+                                    mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+                                )
+                                self.sock.sendto(cnt_msg.pack(self.mav), (self.target_host, self.target_port))
+
+                            elif hasattr(p_msg, "get_type") and p_msg.get_type() in ("MISSION_REQUEST", "MISSION_REQUEST_INT"):
+                                req_seq = getattr(p_msg, "seq", 0)
+                                if req_seq < len(self.flight.mission_waypoints):
+                                    wp = self.flight.mission_waypoints[req_seq]
+                                    item_msg = self.mav.mission_item_int_encode(
+                                        target_system=1,
+                                        target_component=1,
+                                        seq=req_seq,
+                                        frame=mavlink2.MAV_FRAME_GLOBAL_RELATIVE_ALT,
+                                        command=wp.get("command", 16),
+                                        current=1 if req_seq == self.flight.current_wp_idx else 0,
+                                        autocontinue=1,
+                                        param1=0.0,
+                                        param2=2.0,
+                                        param3=0.0,
+                                        param4=0.0,
+                                        x=int(wp["lat"] * 1e7),
+                                        y=int(wp["lon"] * 1e7),
+                                        z=float(wp["alt_m"]),
+                                        mission_type=mavlink2.MAV_MISSION_TYPE_MISSION,
+                                    )
+                                    self.sock.sendto(item_msg.pack(self.mav), (self.target_host, self.target_port))
                 except Exception as e:
                     logger.debug(f"Error parsing incoming MAVLink frame in simulator: {e}")
         except (BlockingIOError, socket.error):
@@ -387,13 +498,52 @@ class TelemetrySimulator:
         )
         msg_sys.source_sequence = seq
 
+        # 5. GPS_RAW_INT
+        msg_gps = self.mav.gps_raw_int_encode(
+            time_usec=now_ms * 1000,
+            fix_type=3,
+            lat=lat_int,
+            lon=lon_int,
+            alt=alt_int,
+            eph=120,
+            epv=180,
+            vel=int(self.flight.ground_speed_mps * 100),
+            cog=int(self.flight.yaw_deg * 100),
+            satellites_visible=14,
+        )
+        msg_gps.source_sequence = seq
+
         # Pack into combined datagram
         packed_bytes = (
             msg_hb.pack(self.mav)
             + msg_att.pack(self.mav)
             + msg_pos.pack(self.mav)
             + msg_sys.pack(self.mav)
+            + msg_gps.pack(self.mav)
         )
+
+        # 6. Periodic HOME_POSITION (1Hz)
+        if seq % 10 == 0:
+            msg_home = self.mav.home_position_encode(
+                latitude=int(self.flight.home_lat * 1e7),
+                longitude=int(self.flight.home_lon * 1e7),
+                altitude=0,
+                x=0.0,
+                y=0.0,
+                z=0.0,
+                q=[1.0, 0.0, 0.0, 0.0],
+                approach_x=0.0,
+                approach_y=0.0,
+                approach_z=0.0,
+            )
+            msg_home.source_sequence = seq
+            packed_bytes += msg_home.pack(self.mav)
+
+        # 7. MISSION_CURRENT (when waypoints loaded)
+        if self.flight.mission_waypoints:
+            msg_cur = self.mav.mission_current_encode(seq=self.flight.current_wp_idx)
+            msg_cur.source_sequence = seq
+            packed_bytes += msg_cur.pack(self.mav)
 
         # Cache for retransmission
         self.packet_cache[seq] = packed_bytes

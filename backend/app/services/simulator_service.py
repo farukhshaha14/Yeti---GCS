@@ -88,6 +88,11 @@ class ManagedSimulatorService:
             self.simulator.set_loss_rate(rate)
             return {"status": "ok", "action": "SET_LOSS_RATE", "rate": rate}
 
+        elif mode == "out_of_order":
+            seq = int(param) if param is not None else (self.simulator.sequence_number + 1)
+            self.simulator.inject_out_of_order(seq)
+            return {"status": "ok", "action": "INJECT_OUT_OF_ORDER", "target_sequence": seq}
+
         elif mode == "disconnect":
             self.simulator.set_disconnected(True)
             return {"status": "ok", "action": "DISCONNECT"}

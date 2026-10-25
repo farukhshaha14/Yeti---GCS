@@ -80,6 +80,15 @@ class UdpTelemetryTransport(TelemetryTransport):
             self._protocol = protocol
             self._is_running = True
             self._socket_state = "OPEN"
+
+            # Optimize OS UDP socket receive buffer to 1MB for telemetry bursts
+            sock = transport.get_extra_info("socket")
+            if sock:
+                import socket
+                try:
+                    sock.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1024 * 1024)
+                except Exception as e:
+                    logger.debug(f"Could not set SO_RCVBUF: {e}")
         except Exception as e:
             self._socket_state = f"ERROR: {str(e)}"
             logger.error(f"Failed to bind UDP port {self.bind_port} on {self.bind_host}: {e}")
@@ -92,6 +101,26 @@ class UdpTelemetryTransport(TelemetryTransport):
             self._asyncio_transport.close()
         self._socket_state = "CLOSED"
         logger.info("UDP Telemetry transport stopped.")
+
+    async def rebind(
+        self,
+        bind_host: Optional[str] = None,
+        bind_port: Optional[int] = None,
+        default_target_host: Optional[str] = None,
+        default_target_port: Optional[int] = None,
+    ) -> None:
+        """Dynamically rebind the UDP transport socket without stopping the whole server."""
+        await self.stop()
+        if bind_host is not None:
+            self.bind_host = bind_host
+        if bind_port is not None:
+            self.bind_port = bind_port
+        if default_target_host is not None:
+            self.default_target_host = default_target_host
+        if default_target_port is not None:
+            self.default_target_port = default_target_port
+        await self.start()
+        logger.info(f"UDP transport successfully rebound to {self.bind_host}:{self.bind_port}")
 
     def _record_packet_in(self, data: bytes, addr: Tuple[str, int], recv_ms: int) -> None:
         self._packets_received += 1

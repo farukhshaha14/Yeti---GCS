@@ -30,8 +30,41 @@ const initialTelemetry: NormalizedTelemetry = {
     current_a: null,
   },
   gps: {
+    latitude: null,
+    longitude: null,
+    altitude_m: null,
+    relative_altitude_m: null,
+    heading_deg: null,
+    gps_fix: false,
+    fix_status: 'NO_FIX',
     fix_type: null,
     satellites: null,
+    hdop: null,
+    vdop: null,
+    timestamp: null,
+    valid: false,
+    last_update_ms: null,
+    is_stale: false,
+  },
+  navigation: {
+    heading_deg: null,
+    ground_speed_mps: null,
+    distance_to_home_m: null,
+    bearing_to_home_deg: null,
+  },
+  home: {
+    latitude: null,
+    longitude: null,
+    altitude_m: null,
+    is_set: false,
+    timestamp: null,
+  },
+  mission_progress: {
+    current_seq: null,
+    total_seq: null,
+    reached_seq: null,
+    is_active: false,
+    progress_pct: 0,
   },
   flight: {
     armed: null,
@@ -59,11 +92,13 @@ interface TelemetryStateStore {
   telemetry: NormalizedTelemetry;
   setTelemetry: (data: NormalizedTelemetry) => void;
   updateFromTick: (data: Partial<NormalizedTelemetry>) => void;
+  resetTelemetry: () => void;
 }
 
 export const useTelemetryStore = create<TelemetryStateStore>((set) => ({
   telemetry: initialTelemetry,
   setTelemetry: (data) => set({ telemetry: data }),
+  resetTelemetry: () => set({ telemetry: initialTelemetry }),
   updateFromTick: (patch) =>
     set((state) => ({
       telemetry: {
@@ -74,6 +109,9 @@ export const useTelemetryStore = create<TelemetryStateStore>((set) => ({
         velocity: { ...state.telemetry.velocity, ...(patch.velocity || {}) },
         battery: { ...state.telemetry.battery, ...(patch.battery || {}) },
         gps: { ...state.telemetry.gps, ...(patch.gps || {}) },
+        navigation: { ...state.telemetry.navigation, ...(patch.navigation || {}) },
+        home: { ...state.telemetry.home, ...(patch.home || {}) },
+        mission_progress: { ...state.telemetry.mission_progress, ...(patch.mission_progress || {}) },
         flight: { ...state.telemetry.flight, ...(patch.flight || {}) },
         data_health: { ...state.telemetry.data_health, ...(patch.data_health || {}) },
       },
